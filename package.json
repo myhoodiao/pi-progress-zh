@@ -1,0 +1,23 @@
+{
+  "name": "pi-progress-zh",
+  "version": "0.9.0",
+  "type": "module",
+  "description": "Compact tool summaries and Chinese progress commentary for Pi Agent CLI. Less command clutter, more focused vibe coding. 中文过程说明与简洁工具摘要。",
+  "keywords": ["pi-package", "pi-extension", "pi-agent", "cli", "tui", "chinese", "vibe-coding", "tool-summary"],
+  "license": "MIT",
+  "author": "myhoodiao",
+  "repository": { "type": "git", "url": "git+https://github.com/myhoodiao/pi-progress-zh.git" },
+  "homepage": "https://github.com/myhoodiao/pi-progress-zh#readme",
+  "bugs": { "url": "https://github.com/myhoodiao/pi-progress-zh/issues" },
+  "files": ["index.ts", "README.md", "LICENSE", "docs/images/"],
+  "publishConfig": { "access": "public", "registry": "https://registry.npmjs.org/" },
+  "pi": {
+    "extensions": ["./index.ts"],
+    "image": "https://raw.githubusercontent.com/myhoodiao/pi-progress-zh/main/docs/images/windows-terminal-demo.png"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "scripts": { "test": "node --test test/render.test.mjs" }
+}
