@@ -1,6 +1,6 @@
 {
   "name": "pi-progress-zh",
-  "version": "0.9.0",
+  "version": "0.10.0",
   "type": "module",
   "description": "Compact tool summaries and Chinese progress commentary for Pi Agent CLI. Less command clutter, more focused vibe coding. 中文过程说明与简洁工具摘要。",
   "keywords": ["pi-package", "pi-extension", "pi-agent", "cli", "tui", "chinese", "vibe-coding", "tool-summary"],

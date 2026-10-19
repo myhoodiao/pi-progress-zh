@@ -9,6 +9,11 @@ import test from "node:test";
 delete process.env.NO_COLOR;
 process.env.FORCE_COLOR = "3";
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+// Both supported display combinations use this same behavioral suite.
+const source = readFileSync(join(root, "index.ts"), "utf8");
+const INTRA_GAP = Number(source.match(/const INTRA_GAP = (\d);/)[1]);
+const ENABLE_DITTO = source.match(/const ENABLE_DITTO = (true|false);/)[1] === "true";
+assert.ok([1, 2].includes(INTRA_GAP));
 const install = join(homedir(), ".pi", "agent", "install");
 const release = readFileSync(join(install, "current-version"), "utf8").trim();
 const modules = join(install, "releases", release, "node_modules");
@@ -43,7 +48,14 @@ function assertNoBackground(item) {
   assert.ok(item.render(120).every(line => !line.includes("\x1b[48;")));
 }
 const fileColor = tui.parseColor("#C9BA9A");
-function fileText(value) { return theme.style(value, { fg: fileColor, bold: true }); }
+function fileText(value) {
+  const range = value.match(/:\d+(?:-\d+)?$/)?.[0] ?? "";
+  const body = range ? value.slice(0, -range.length) : value;
+  const split = Math.max(body.lastIndexOf("/"), body.lastIndexOf("\\")) + 1;
+  return theme.style(body.slice(0, split), { fg: tui.parseColor("#8E846E"), bold: false })
+    + theme.style(body.slice(split), { fg: fileColor, bold: false })
+    + theme.style(range, { fg: tui.parseColor("#6E797C"), bold: false });
+}
 function softErrorText(value) { return theme.style(value, { fg: tui.parseColor("#D99083") }); }
 
 test("pending, streaming and success keep one summary; output and arguments survive", () => {
@@ -118,7 +130,7 @@ test("file targets use the selected color and the type label is muted", () => {
   read.updateResult(goodResult(), false);
   const readRow = read.render(120).join("\n");
   assert.ok(readRow.includes(fileText("src/config/app.json")));
-  assert.ok(readRow.includes(theme.style("  read", { fg: tui.parseColor("#838D91") })));
+  assert.ok(readRow.includes(theme.style("  read", { fg: tui.parseColor("#687478") })));
   assertNoBackground(read);
   const custom = component("mcp_file", { file_path: "other/file.txt", content: "PRIVATE_BODY" });
   assert.ok(custom.render(120).join("\n").includes(fileText("other/file.txt")));
@@ -141,11 +153,14 @@ test("file targets use the selected color and the type label is muted", () => {
   assert.doesNotMatch(lines(error), /PRIVATE_ERROR/);
 });
 
-test("long primary summaries preserve the final target", () => {
+test("long primary summaries preserve filenames and count omitted whole targets", () => {
   const grep = component("grep", { pattern: "a".repeat(100), path: "src/final-target.md" });
   assert.match(lines(grep, 80), /final-target\.md/);
   const copy = component("bash", { command: `cp ${"long/".repeat(20)}source.md target.md` });
-  assert.match(lines(copy, 80), /target\.md/);
+  assert.match(summaryRows(copy, 80)[0], /source\.md\s+\+1/);
+  copy.setExpanded(true);
+  assert.match(lines(copy, 240), /target\.md/);
+  copy.setExpanded(false);
   assert.ok(copy.render(55).every(line => tui.visibleWidth(line) <= 55));
 });
 
@@ -249,7 +264,7 @@ test("simple file command targets shorten without changing commands or their sea
   const item = component("bash", { command }, undefined, { cwd: "C:/work/demo" });
   item.updateResult(goodResult(), false);
   const collapsed = lines(item, 220);
-  assert.ok(collapsed.includes('"src/input file.md", "…/archive/reports/output file.md"'));
+  assert.ok(collapsed.includes('src/input file.md, …/archive/reports/output file.md'));
   assert.ok(collapsed.includes(command));
   assert.doesNotMatch(collapsed, /\[done\]/);
   item.setExpanded(true);
@@ -376,12 +391,12 @@ test("codemode nested snapshots replace rows, retain all calls and hide script o
   const item = component("codemode", { code: "await tools.read({path:'sample.md'});\nPRIVATE_SCRIPT_BODY" });
   const first = { name: "read", args: '{"path":"sample.md"}', status: "running" };
   item.updateResult({ content: [], details: { calls: [first] } }, true);
-  assert.equal(item.render(120).length, 5);
+  assert.equal(item.render(120).length, 3 + INTRA_GAP);
   assert.match(lines(item), /sample.md.*running/);
   const calls = [{ ...first, status: "ok" }, { name: "bash", args: '{"command":"echo demo"}', status: "error", error: "PRIVATE_NESTED_ERROR" }, { name: "mcp_custom", args: "resource://demo", status: "cancelled" }];
   item.updateResult({ content: [{ type: "text", text: "PRIVATE_SCRIPT_OUTPUT" }], details: { calls } }, false);
   const collapsed = lines(item);
-  assert.equal(item.render(120).length, 11);
+  assert.equal(item.render(120).length, 2 + 3 * (INTRA_GAP + 1));
   assert.equal(collapsed.split("\n").filter(line => /^\s*sample.md .*read/.test(line)).length, 1);
   assert.doesNotMatch(collapsed, /\[done\]/);
   assert.match(collapsed, /bash.*failed/);
@@ -392,7 +407,7 @@ test("codemode nested snapshots replace rows, retain all calls and hide script o
   assert.match(lines(item), /PRIVATE_SCRIPT_OUTPUT/);
   assert.match(lines(item), /PRIVATE_NESTED_ERROR/);
   item.setExpanded(false);
-  assert.equal(item.render(120).length, 11);
+  assert.equal(item.render(120).length, 2 + 3 * (INTRA_GAP + 1));
 });
 
 test("200 tools add only their summary and native spacer, without output accumulation", () => {
@@ -434,7 +449,7 @@ async function resetGroups() {
 function transcript(items, width = 80) {
   return items.flatMap(item => item.render(width));
 }
-test("same-response tools have two blank rows between summaries; streaming and expansion stay intact", async () => {
+test("same-response tools use the configured gap; streaming and expansion stay intact", async () => {
   await resetGroups();
   const message = assistantCalls(["group-a", "group-b", "group-c"]);
   const before = JSON.stringify(message);
@@ -445,7 +460,7 @@ test("same-response tools have two blank rows between summaries; streaming and e
   const third = component("read", { path: "group-c.md" }, native("read"), { callId: "group-c" });
   const items = [first, second, third];
   const pending = transcript(items).map(tui.stripTerminalSequences).join("\n");
-  assert.equal(transcript(items).length, 8);
+  assert.equal(transcript(items).length, 4 + 2 * INTRA_GAP);
   assert.equal(second.render(80).length, 0);
   assert.match(pending, /group-a\.md.*pending/);
   second.markExecutionStarted();
@@ -460,7 +475,7 @@ test("same-response tools have two blank rows between summaries; streaming and e
   assertNoBackground(first);
   assert.doesNotMatch(collapsed, /GROUP_PRIVATE_ERROR|original-line/);
   for (const width of [32, 80, 140]) {
-    assert.equal(transcript(items, width).length, 8);
+    assert.equal(transcript(items, width).length, 4 + 2 * INTRA_GAP);
     assert.ok(transcript(items, width).every(line => tui.visibleWidth(line) <= width));
   }
   for (const item of items) item.setExpanded(true);
@@ -475,7 +490,7 @@ test("same-response tools have two blank rows between summaries; streaming and e
   assert.match(lines(first), /group-a\.md/);
   assert.match(lines(third), /group-c\.md/);
   second.setExpanded(false);
-  assert.equal(transcript(items).length, 8);
+  assert.equal(transcript(items).length, 4 + 2 * INTRA_GAP);
   assert.equal(JSON.stringify(message), before);
 });
 
@@ -487,18 +502,18 @@ test("tool-only responses share a stage; visible text and user input start a new
   await observe({ role: "toolResult", toolCallId: "cross-a" }, "message_start");
   await observe(assistantCalls(["cross-b"]));
   const second = component("read", { path: "cross-b.md" }, undefined, { callId: "cross-b" });
-  assert.equal(transcript([first, second]).length, 5);
+  assert.equal(transcript([first, second]).length, 3 + INTRA_GAP);
   assert.match(lines(first), /cross-b\.md/);
   assert.equal(second.render(80).length, 0);
   await observe({ role: "assistant", content: [{ type: "text", text: "*进入下一阶段。*" }] });
   await observe(assistantCalls(["cross-c"]));
   const third = component("read", { path: "cross-c.md" }, undefined, { callId: "cross-c" });
-  assert.equal(transcript([first, second, third]).length, 7);
+  assert.equal(transcript([first, second, third]).length, 5 + INTRA_GAP);
   assert.doesNotMatch(lines(first), /cross-c\.md/);
   await observe({ role: "user", content: "继续" }, "message_start");
   await observe(assistantCalls(["cross-d"]));
   const fourth = component("read", { path: "cross-d.md" }, undefined, { callId: "cross-d" });
-  assert.equal(transcript([first, second, third, fourth]).length, 9);
+  assert.equal(transcript([first, second, third, fourth]).length, 7 + INTRA_GAP);
 });
 
 test("thinking before each tool keeps Gemini-style rows near their original slot", async () => {
@@ -550,7 +565,7 @@ test("resume, tree and compaction restore cross-response stages", async () => {
     await extension.handlers.get(event)[0]({}, context);
     const items = ["restore-a", "restore-b", "restore-c", "restore-d"].map(id => component("read", { path: `${id}.md` }, undefined, { callId: id }));
     for (const item of items) item.updateResult(goodResult(), false);
-    assert.equal(transcript(items).length, 12); // Four internal rows, one before the next explanation, one after it.
+    assert.equal(transcript(items).length, 6 + 3 * INTRA_GAP); // Three intra-node gaps and the cross-node top-up.
     assert.match(lines(items[0]), /restore-c/);
     assert.doesNotMatch(lines(items[0]), /restore-d/);
     assert.match(lines(items[3]), /restore-d/);
@@ -568,25 +583,25 @@ test("grouped codemode lists update once and enabling images keeps native slots"
   for (const status of ["running", "ok"]) first.updateResult({ content: [], details: { calls: [{ name: "read", args: "nested.md", status }] } }, status === "running");
   second.updateResult(goodResult(), false);
   const text = transcript([first, second]).map(tui.stripTerminalSequences).join("\n");
-  assert.equal(transcript([first, second]).length, 8);
+  assert.equal(transcript([first, second]).length, 4 + 2 * INTRA_GAP);
   assert.equal(text.split("nested.md").length - 1, 1);
   await resetGroups();
   await observe(assistantCalls(["images-a", "images-b"]));
   const images = ["images-a", "images-b"].map(id => component("read", { path: "image.png" }, undefined, { callId: id, showImages: true }));
-  assert.equal(transcript(images).length, 5); // Separate native slots, topped up from one to two blank rows.
-  assert.deepEqual(visibleGaps(images), [2]);
+  assert.equal(transcript(images).length, 3 + INTRA_GAP); // Separate native slots retain their own spacer.
+  assert.deepEqual(visibleGaps(images), [INTRA_GAP]);
 });
 
-test("200 calls retain all ordered summaries with exactly two internal blank rows", async () => {
+test("200 calls retain all ordered summaries with the configured internal gap", async () => {
   await resetGroups();
   const ids = Array.from({ length: 200 }, (_, i) => `batch-${i}`);
   await observe(assistantCalls(ids));
   const items = ids.map(id => component("read", { path: `${id}.md` }, undefined, { callId: id }));
   for (const item of items) item.updateResult(goodResult(), false);
   const rows = transcript(items).map(tui.stripTerminalSequences);
-  assert.equal(rows.length, 599);
+  assert.equal(rows.length, 201 + 199 * INTRA_GAP);
   assert.deepEqual(rows.filter(line => line.trim()).map(line => line.match(/batch-\d+\.md/)[0]), ids.map(id => `${id}.md`));
-  assert.deepEqual(visibleGaps(items), Array(199).fill(2));
+  assert.deepEqual(visibleGaps(items), Array(199).fill(INTRA_GAP));
 });
 
 // Exercise actual message_start/update/end ordering, including native assistant spacers.
@@ -611,7 +626,7 @@ function visibleGaps(items, width = 80) {
 const narration = text => ({ type: "text", text: `*${text}*` });
 const thought = { type: "thinking", thinking: "SYNTHETIC_THINKING" };
 
-test("normal stages target two blank rows while larger native gaps remain", async () => {
+test("normal stages distinguish intra-node and stage gaps while larger native gaps remain", async () => {
   for (const hidden of [true, false]) {
     hiddenThinking = hidden;
     await transformerSetup();
@@ -624,8 +639,8 @@ test("normal stages target two blank rows while larger native gaps remain", asyn
     const before = JSON.stringify(stages.map(s => s.message));
     for (const width of [32, 80, 140]) {
       const items = stages.flatMap(s => s.items);
-      assert.deepEqual(visibleGaps(items, width), Array.from({ length: 23 }, (_, i) => hidden && i % 4 === 1 ? 3 : 2));
-      assert.equal(transcript(items, width).length, hidden ? 77 : 71); // Same 24 visible lines; native three-row prefixes are retained.
+      assert.deepEqual(visibleGaps(items, width), Array.from({ length: 23 }, (_, i) => i % 2 === 0 ? INTRA_GAP : hidden && i % 4 === 1 ? 3 : 2));
+      assert.equal(transcript(items, width).length, (hidden ? 53 : 47) + 12 * INTRA_GAP); // Same 24 visible lines; native three-row prefixes are retained.
       assert.ok(transcript(items, width).every(row => tui.visibleWidth(row) <= width));
     }
     assert.equal(JSON.stringify(stages.map(s => s.message)), before);
@@ -642,7 +657,7 @@ test("thinking-only stages and merged pure-tool batches target two rows, includi
   const c = await stage([thought, ...assistantCalls(["compact-d"]).content]);
   const final = await stage([{ type: "text", text: "最终结论正常显示。" }], { stopReason: "stop" });
   const items = [...a.items, ...b.items, ...c.items, ...final.items];
-  assert.deepEqual(visibleGaps(items), [2, 2, 2, 2]);
+  assert.deepEqual(visibleGaps(items), [INTRA_GAP, INTRA_GAP, 2, 2]);
   assert.equal(items.flatMap(item => item.render(80)).map(tui.stripTerminalSequences).filter(row => /compact-/.test(row)).length, 4);
   hiddenThinking = true;
 });
@@ -669,14 +684,14 @@ test("expansion, errors and image permission retain native details without compe
   a.tools[1].updateResult({ content: [{ type: "text", text: "ORIGINAL_FAILURE" }], isError: true }, false);
   const original = transcript([...a.items, ...b.items]).map(tui.stripTerminalSequences).join("\n");
   assert.match(original, /expand-gap-b.*error/);
-  assert.deepEqual(visibleGaps([...a.items, ...b.items]), [2, 2, 2]);
+  assert.deepEqual(visibleGaps([...a.items, ...b.items]), [INTRA_GAP, 2, INTRA_GAP]);
   a.tools[1].setExpanded(true);
   assert.match(lines(a.tools[1]), /ORIGINAL_FAILURE/);
   assert.equal(a.tools[0].render(80).length, 2);
   a.tools[1].setExpanded(false);
   assert.equal(transcript([...a.items, ...b.items]).map(tui.stripTerminalSequences).join("\n"), original);
   a.tools.forEach(item => item.setShowImages(true));
-  assert.equal(transcript(a.tools).length, 6); // Permission alone does not disable text spacing.
+  assert.equal(transcript(a.tools).length, 4 + INTRA_GAP); // Permission alone does not disable text spacing.
   a.tools.forEach(item => item.setShowImages(false));
   assert.equal(transcript([...a.items, ...b.items]).map(tui.stripTerminalSequences).join("\n"), original);
 });
@@ -687,11 +702,11 @@ test("large native gaps are not inflated globally and user boundaries stop compe
   const empty = await stage([thought]);
   const b = await stage([thought, narration("已有大间距"), ...assistantCalls(["large-gap-b"]).content]);
   const c = await stage([narration("普通间距"), ...assistantCalls(["large-gap-c"]).content]);
-  assert.deepEqual(visibleGaps([...a.items, ...empty.items, ...b.items, ...c.items]), [5, 2, 2, 2]);
+  assert.deepEqual(visibleGaps([...a.items, ...empty.items, ...b.items, ...c.items]), [5, INTRA_GAP, 2, INTRA_GAP]);
   await observe({ role: "user", content: "新任务" }, "message_start");
   const d = await stage([narration("新任务说明"), ...assistantCalls(["large-gap-d"]).content]);
-  assert.equal(c.tools[0].render(80).length, 3); // Only its explanation-to-tool top-up remains.
-  assert.equal(d.tools[0].render(80).length, 3);
+  assert.equal(c.tools[0].render(80).length, 1 + INTRA_GAP); // Only its explanation-to-tool top-up remains.
+  assert.equal(d.tools[0].render(80).length, 1 + INTRA_GAP);
 });
 
 test("unsupported interleaving and assistant errors keep native gaps", async () => {
@@ -700,7 +715,7 @@ test("unsupported interleaving and assistant errors keep native gaps", async () 
     const a = await stage(assistantCalls([`unsupported-${stopReason}`]).content);
     await stage([...assistantCalls([`later-${stopReason}`]).content, narration("工具之后的文字")], { stopReason });
     const rows = a.tools[0].render(80).map(tui.stripTerminalSequences);
-    assert.equal(rows.filter(row => !row.trim()).length, 3); // Native leading spacer + two between grouped summaries, no boundary top-up.
+    assert.equal(rows.filter(row => !row.trim()).length, 1 + INTRA_GAP); // Native leading spacer + internal gap, no boundary top-up.
     assert.equal(rows.filter(row => row.trim()).length, 2); // Existing pure-tool merge keeps both real calls.
     if (stopReason !== "toolUse") {
       await transformerSetup();
@@ -726,7 +741,7 @@ test("spacing survives session restore, tree and compaction without changing bra
       tool.updateResult(goodResult(), false);
       return [s.assistant, tool];
     });
-    assert.deepEqual(visibleGaps(items), [2, 2, 2]);
+    assert.deepEqual(visibleGaps(items), [INTRA_GAP, 2, INTRA_GAP]);
   }
   assert.equal(JSON.stringify(branch), before);
 });
@@ -739,24 +754,24 @@ test("codemode nested rows also have two blank rows without losing calls or stat
     { name: "bash", args: "synthetic", status: "cancelled" },
   ] } }, false);
   const b = await stage([narration("核对结果"), ...assistantCalls(["gap-after-codemode"]).content]);
-  assert.deepEqual(visibleGaps([...a.items, ...b.items]), [2, 2, 2, 2]);
+  assert.deepEqual(visibleGaps([...a.items, ...b.items]), [INTRA_GAP, INTRA_GAP, 2, INTRA_GAP]);
   assert.match(lines(a.tools[0]), /cancelled/);
 });
 
-test("one explanation with several commands has two-row gaps with images allowed or disabled", async () => {
+test("one explanation with several commands uses intra-node gaps with images allowed or disabled", async () => {
   for (const showImages of [true, false]) {
     await transformerSetup();
     const sample = await stage([narration("检查配置"), ...assistantCalls(["two-a", "two-b", "two-c"]).content], { showImages });
     const before = JSON.stringify(sample.message);
     for (const width of [32, 80, 140]) {
-      assert.deepEqual(visibleGaps(sample.items, width), [2, 2, 2]);
-      assert.equal(transcript(sample.items, width).length, 11);
+      assert.deepEqual(visibleGaps(sample.items, width), [INTRA_GAP, INTRA_GAP, INTRA_GAP]);
+      assert.equal(transcript(sample.items, width).length, 5 + 3 * INTRA_GAP);
       assert.ok(transcript(sample.items, width).every(row => tui.visibleWidth(row) <= width));
     }
     for (const tool of sample.tools) tool.setExpanded(true);
     assert.equal(transcript(sample.items).map(tui.stripTerminalSequences).join("\n").split("original-line-119").length - 1, 3);
     for (const tool of sample.tools) tool.setExpanded(false);
-    assert.deepEqual(visibleGaps(sample.items), [2, 2, 2]);
+    assert.deepEqual(visibleGaps(sample.items), [INTRA_GAP, INTRA_GAP, INTRA_GAP]);
     assert.equal(JSON.stringify(sample.message), before);
   }
 });
@@ -767,10 +782,10 @@ test("separate explanation responses and thinking after text account for existin
     await transformerSetup();
     const explanation = await stage([narration("开始检查")]);
     const calls = await stage(assistantCalls(["separate-explanation"]).content);
-    assert.deepEqual(visibleGaps([...explanation.items, ...calls.items]), [2]);
+    assert.deepEqual(visibleGaps([...explanation.items, ...calls.items]), [INTRA_GAP]);
     await transformerSetup();
     const sample = await stage([narration("继续检查"), thought, ...assistantCalls(["trailing-thought"]).content]);
-    assert.deepEqual(visibleGaps(sample.items), [2]); // Hidden thought already contributes one of the two rows.
+    assert.deepEqual(visibleGaps(sample.items), [Math.max(INTRA_GAP, hidden ? 2 : 1)]); // Never remove native hidden-thinking space.
   }
   hiddenThinking = true;
 });
@@ -783,22 +798,22 @@ test("streaming explanation-to-tool padding is stable through repeated tool snap
   const tool = component("read", { path: "stream-two.md" }, undefined, { callId: "stream-two" });
   const assistant = new agent.AssistantMessageComponent(message, true, agent.getMarkdownTheme(), "", 1, [extension.markdownTransformer]);
   for (let index = 0; index < 20; index++) await observe(structuredClone(message));
-  assert.deepEqual(visibleGaps([assistant, tool]), [2]);
+  assert.deepEqual(visibleGaps([assistant, tool]), [INTRA_GAP]);
   tool.updateResult(goodResult(), false);
   await observe(message, "message_end");
-  assert.deepEqual(visibleGaps([assistant, tool]), [2]);
-  assert.equal(tool.render(80).length, 3); // Native spacer + one top-up + summary; no empty tail.
+  assert.deepEqual(visibleGaps([assistant, tool]), [INTRA_GAP]);
+  assert.equal(tool.render(80).length, 1 + INTRA_GAP); // Native spacer + any top-up + summary; no empty tail.
 });
 
 test("actual image results disable group compensation without disabling text-only permission", async () => {
   await transformerSetup();
   const sample = await stage([narration("读取图片"), ...assistantCalls(["real-image-a", "real-image-b"]).content], { showImages: true });
-  assert.deepEqual(visibleGaps(sample.items), [2, 2]);
+  assert.deepEqual(visibleGaps(sample.items), [INTRA_GAP, INTRA_GAP]);
   // Empty image data avoids terminal protocol output here; the image block still marks an image-bearing result.
   sample.tools[0].updateResult({ content: [{ type: "image", mimeType: "image/png", data: "" }] }, false);
   assert.deepEqual(visibleGaps(sample.items), [1, 1]);
   sample.tools[0].setShowImages(false);
-  assert.deepEqual(visibleGaps(sample.items), [2, 2]);
+  assert.deepEqual(visibleGaps(sample.items), [INTRA_GAP, INTRA_GAP]);
 });
 
 test("two-line spacing survives restore and a subsequent live response with image permission", async () => {
@@ -812,7 +827,7 @@ test("two-line spacing survives restore and a subsequent live response with imag
     return tool;
   });
   const next = await stage([narration("下一步"), ...assistantCalls(["live-after-restore-c"]).content], { showImages: true });
-  assert.deepEqual(visibleGaps([first.assistant, ...oldTools, ...next.items]), [2, 2, 2, 2]);
+  assert.deepEqual(visibleGaps([first.assistant, ...oldTools, ...next.items]), [INTRA_GAP, INTRA_GAP, 2, INTRA_GAP]);
 });
 
 test("codemode text results retain two-line nested gaps with image permission enabled", async () => {
@@ -821,18 +836,20 @@ test("codemode text results retain two-line nested gaps with image permission en
   sample.tools[0].updateResult({ content: [], details: { calls: [
     { name: "read", args: "sample.md", status: "ok" }, { name: "bash", args: "synthetic", status: "error" },
   ] } }, false);
-  assert.deepEqual(visibleGaps(sample.items), [2, 2]);
+  assert.deepEqual(visibleGaps(sample.items), [INTRA_GAP, INTRA_GAP]);
   assert.match(lines(sample.tools[0]), /failed/);
 });
 
 test("status identifies the trial version and its limits", async () => {
   const notices = [];
   await extension.commands.get("progress").handler("status", { mode: "tui", ui: { notify: text => notices.push(text) } });
-  assert.match(notices.join("\n"), /0\.9\.0/);
+  assert.match(notices.join("\n"), /0\.10\.0/);
   assert.match(notices.join("\n"), /成功不显示/);
   assert.match(notices.join("\n"), /相对路径/);
   assert.match(notices.join("\n"), /2 行/);
-  assert.match(notices.join("\n"), /C 目标优先、S1\+S2/);
+  assert.ok(notices[0].includes(`G+H+I+J${INTRA_GAP === 1 ? "+K" : ""}${ENABLE_DITTO ? "+L" : ""}`));
+  assert.ok(notices.join("\n").includes(`以 ${INTRA_GAP} 行空白`));
+  assert.match(notices.join("\n"), /中文与工具目标均不加粗/);
   assert.match(notices.join("\n"), /宽度的一半/);
   assert.match(notices.join("\n"), /右缘元信息栏/);
   assert.match(notices.join("\n"), /重复片段省略/);
@@ -861,8 +878,8 @@ test("narration uses a guide and clause contrast while final prose stays unchang
   const source = "*先读取项目规则，确认修改位置。*\n\n最终结论正常显示。";
   const styled = transform(source, context);
   assert.equal(tui.stripTerminalSequences(styled), "▎ 先读取项目规则，确认修改位置。\n\n最终结论正常显示。");
-  assert.ok(styled.includes("\x1b[38;2;210;218;217m"));
-  assert.ok(styled.includes("\x1b[38;2;148;158;162m"));
+  assert.ok(styled.includes("\x1b[38;2;232;236;234m"));
+  assert.ok(styled.includes("\x1b[38;2;142;153;156m"));
   for (const width of [32, 80]) {
     const rendered = new tui.Markdown(styled, 1, 0, agent.getMarkdownTheme()).render(width);
     assert.ok(rendered.some(line => line.includes("▎")));
@@ -1001,9 +1018,9 @@ test("S1+S2 wraps at the available width with hanging continuation and no source
     const source = `*${raw}*`;
     const item = new tui.Markdown(source, 1, 0, agent.getMarkdownTheme(), undefined, { transform: value => transform(value, context) });
     const rows = item.render(width).map(tui.stripTerminalSequences).filter(line => line.trim());
-    assert.equal(rows.filter(line => line.includes("▎")).length, 1);
+    assert.equal(rows.filter(line => line.includes("▎")).length, rows.length);
     assert.ok(rows[0].trimStart().startsWith("▎ "));
-    assert.ok(rows.slice(1).every(line => line.trimStart().startsWith("│ ")));
+    assert.ok(rows.slice(1).every(line => line.trimStart().startsWith("▎ ")));
     assert.ok(rows.every(line => tui.visibleWidth(line.trimEnd()) <= Math.min(width, 72)));
     assert.equal(rows.join("").replace(/[\s▎│]/g, ""), raw.replace(/\s/g, ""));
     assert.equal(source, `*${raw}*`);
@@ -1021,12 +1038,12 @@ test("S1+S2 handles inline identifiers and theme changes without styling final p
     assert.match(plain, /▎ 先检查 session_name，再核对结果。/);
     assert.doesNotMatch(plain, /\\_|`/);
     assert.match(plain, /最终结论：保留普通格式。/);
-    assert.ok(rows.filter(row => row.includes("最终结论")).every(row => !row.includes("▎") && !row.includes("38;2;210;218;217")));
+    assert.ok(rows.filter(row => row.includes("最终结论")).every(row => !row.includes("▎") && !row.includes("38;2;232;236;234")));
   }
   agent.initTheme("dark", false);
 });
 
-test("two-line commands keep two blank rows between calls in long and restored stages", async () => {
+test("two-line commands keep configured gaps between calls in long and restored stages", async () => {
   await resetGroups();
   const ids = Array.from({ length: 30 }, (_, i) => `two-row-${i}`);
   const message = { role: "assistant", content: ids.map(id => ({ type: "toolCall", id, name: "bash", arguments: { command: `node --test test/${id}.mjs` } })) };
@@ -1037,11 +1054,11 @@ test("two-line commands keep two blank rows between calls in long and restored s
     const tools = ids.map(id => component("bash", { command: `node --test test/${id}.mjs` }, undefined, { callId: id }));
     const rows = transcript(tools, 80).map(tui.stripTerminalSequences);
     assert.equal(rows.filter(row => row.trim()).length, 60);
-    assert.equal(rows.length, 119);
+    assert.equal(rows.length, 61 + 29 * INTRA_GAP);
     assert.deepEqual(rows.filter(row => /mjs\s+bash/.test(row)).map(row => row.match(/two-row-\d+/)[0]), ids);
     let run = 0, maximum = 0;
     for (const row of rows) { run = row.trim() ? 0 : run + 1; maximum = Math.max(maximum, run); }
-    assert.equal(maximum, 2);
+    assert.equal(maximum, INTRA_GAP);
   }
   assert.equal(JSON.stringify(message), before);
 });
@@ -1133,7 +1150,10 @@ test("recursive and force switches remain visible after a long duplicated target
   const item = component("powershell", { command });
   item.updateResult(goodResult(), false);
   const rows = summaryRows(item, 132);
-  assert.match(rows[0], /source.txt.*output.txt/);
+  assert.match(rows[0], /source.txt\s+\+1/);
+  item.setExpanded(true);
+  assert.match(lines(item, 320), /archive\/output.txt/);
+  item.setExpanded(false);
   assert.match(rows[1], /Copy-Item.*-Recurse.*-Force:\$false/);
   assert.doesNotMatch(rows[1], /long\/long/);
   assertHalf(item, 132);
@@ -1331,7 +1351,7 @@ test('red-box command layout retains a complete useful excerpt when it fits', ()
   const rows=summaryRows(item,132);
   assert.match(rows[0],/src\/session.ts\s+bash/);
   assert.equal(rows[1].trimStart(),"└ " + command);
-  assert.ok(item.render(132).some(row=>row.includes(theme.style(command,{fg:tui.parseColor('#929EA2')}))));
+  assert.ok(item.render(132).some(row=>row.includes(theme.style(command,{fg:tui.parseColor('#7B878A')}))));
   assertHalf(item,80);
 });
 
@@ -1377,14 +1397,14 @@ test("A aligns the type and state on one right edge for short and long targets",
   assert.match(summaryRows(pending, 132)[0], /draft\.md.*write.*\[pending\]$/);
 });
 
-test("C uses a continuous rail, a bold lead, a connector and one trailing ellipsis", async () => {
+test("C and I use the same rail glyph, no bold, a connector and one trailing ellipsis", async () => {
   const transform = await transformerSetup();
   const raw = "先检查 sessionName 与 displayName；再核对来源和很长的目录标识，确认这些字段只影响显示，并继续检查返回结果以及最终说明。";
   const styled = transform(`*${raw}*`, { messageType: "assistant", availableWidth: 78, isStreaming: false });
-  assert.ok(styled.includes("\x1b[1m"));
+  assert.ok(!styled.includes("\x1b[1m"));
   const rows = new tui.Markdown(styled, 1, 0, agent.getMarkdownTheme()).render(80).map(tui.stripTerminalSequences).filter(line => line.trim());
   assert.ok(rows[0].includes("▎"));
-  assert.ok(rows.slice(1).every(line => line.trimStart().startsWith("│ ")));
+  assert.ok(rows.slice(1).every(line => line.trimStart().startsWith("▎ ")));
   const command = component("bash", { command: "Get-Content a.md; Remove-Item b.md -Force" });
   command.updateResult(goodResult(), false);
   const summary = summaryRows(command, 132);
@@ -1412,4 +1432,254 @@ test("F omits only redundant second lines and keeps meaningful excerpts", () => 
     assert.equal(rows.length, 2, command);
     assert.ok(rows[1].trimStart().startsWith("└ "), command);
   }
+});
+
+test("G and J layer directory, filename, range and separators without bold or width drift", async () => {
+  await resetGroups();
+  for (const [name, dir, file, range, sep, meta] of [
+    ["dark", "#8E846E", "#C9BA9A", "#6E797C", "#5F696C", "#687478"],
+    ["light", "#8C826E", "#756344", "#687377", "#788286", "#667377"],
+  ]) {
+    agent.initTheme(name, false);
+    const item = component("read", { path: "src/config/app.json", offset: 2, limit: 4 });
+    item.updateResult(goodResult(), false);
+    const row = item.render(132).find(row => row.includes("app.json"));
+    for (const [text, color] of [["src/config/", dir], ["app.json", file], [":2-5", range], ["  read", meta]]) {
+      assert.ok(row.includes(theme.style(text, { fg: tui.parseColor(color), bold: false })), `${name}: ${text}`);
+    }
+    assert.equal(tui.stripTerminalSequences(row).trim(), "src/config/app.json:2-5" + " ".repeat(38) + "read");
+    assert.equal(tui.visibleWidth(row.trimEnd()), 66);
+    assert.doesNotMatch(row, /\x1b\[1m/);
+    const multi = component("mcp_files", { paths: ["a.md", "b.md"] });
+    multi.updateResult(goodResult(), false);
+    assert.ok(multi.render(132).join("\n").includes(theme.style(", ", { fg: tui.parseColor(sep) })));
+  }
+  agent.initTheme("dark", false);
+});
+
+test("H packs whole target items in order with an accurate +N and no partial later item", async () => {
+  await resetGroups();
+  const targets = ["Win32_Processor", "Win32_PhysicalMemory", "Win32_LogicalDisk", "Win32_VideoController"];
+  const args = { command: targets.map(target => `Get-CimInstance ${target}`).join("; ") };
+  const before = JSON.stringify(args);
+  const item = component("powershell", args);
+  item.updateResult(goodResult(), false);
+  for (const width of [80, 132, 200, 320]) {
+    const row = summaryRows(item, width)[0];
+    const shown = targets.filter(target => row.includes(target));
+    assert.deepEqual(shown, targets.slice(0, shown.length));
+    assert.ok(shown.length >= 1);
+    if (shown.length < targets.length) assert.match(row, new RegExp(`  \\+${targets.length - shown.length}\\s+powershell$`));
+    else assert.doesNotMatch(row, /\+\d/);
+    assert.doesNotMatch(row, /…ivers|insta…|Win32_[A-Za-z]*…/);
+    assertHalf(item, width);
+  }
+  const expression = "([Environment]::GetFolderPath('CommonStartup'))";
+  const ordinary = component("mcp_files", { paths: [expression, "second.md"] });
+  ordinary.updateResult(goodResult(), false);
+  assert.ok(summaryRows(ordinary, 240)[0].includes(expression));
+  assert.equal(JSON.stringify(args), before);
+  item.setExpanded(true);
+  assert.ok(lines(item, 600).includes(JSON.stringify(args.command).slice(1, -1)));
+});
+
+test("H folds long paths only at directory boundaries while preserving complete filenames and ranges", () => {
+  const path = ".pi/agent/install/releases/1.3.0/node_modules/vendor/dist/core/agent-session.js";
+  const item = component("read", { path, offset: 1, limit: 200 });
+  item.updateResult(goodResult(), false);
+  for (const width of [80, 132, 160]) {
+    const row = summaryRows(item, width)[0];
+    assert.match(row, /…\/.*agent-session\.js:1-200/);
+    assert.doesNotMatch(row, /insta…|…ndor|…ssion/);
+    assertHalf(item, width);
+  }
+  item.setExpanded(true);
+  assert.ok(lines(item, 320).includes(path));
+});
+
+test("H unescapes only collapsed shell tokens and preserves Windows paths, regexps and native arguments", () => {
+  for (const command of [String.raw`Get-ChildItem -Path \$env:TEMP`, String.raw`Get-ChildItem -Path \"$env:APPDATA\"`]) {
+    const args = { command };
+    const before = JSON.stringify(args);
+    const item = component("powershell", args);
+    item.updateResult(goodResult(), false);
+    assert.match(summaryRows(item, 240)[0], /\$env:(?:TEMP|APPDATA)/);
+    assert.doesNotMatch(lines(item, 240), /\\[$"]/);
+    assert.doesNotMatch(summaryRows(item, 240)[0], /\$env:APPDATA"/);
+    item.setExpanded(true);
+    assert.ok(lines(item, 600).includes(JSON.stringify(command).slice(1, -1)));
+    assert.equal(JSON.stringify(args), before);
+  }
+  for (const value of [String.raw`C:\Users\demo\regex\d.txt`, String.raw`\d+\s+\Users`]) {
+    const item = component("mcp_query", { query: value });
+    item.updateResult(goodResult(), false);
+    assert.ok(lines(item, 240).includes(value));
+  }
+  for (const [raw, expected] of [["'orphan", "orphan"], ["orphan'", "orphan"], ['"paired"', "paired"], ["can't", "can't"]]) {
+    const item = component("mcp_query", { query: raw });
+    item.updateResult(goodResult(), false);
+    assert.equal(summaryRows(item, 132)[0].trim().split(/\s{2,}/)[0], expected);
+  }
+});
+
+test("H collapses mixed ASCII and Unicode trailing ellipses only in excerpts", () => {
+  for (const tail of ["… …", "... …", "… ...", "... ..."]) {
+    const command = `custom.method() ${tail}`;
+    const item = component("bash", { command });
+    item.updateResult(goodResult(), false);
+    const rows = summaryRows(item, 200);
+    assert.equal(rows.length, 2);
+    assert.match(rows[1], /method\(\) …$/);
+    assert.doesNotMatch(rows[1], /(?:(?:\.{3}|…)\s*){2,}$/);
+    item.setExpanded(true);
+    assert.ok(lines(item, 320).includes(command));
+  }
+});
+
+test("I and J use normal weight, three narration brightness levels and identical rail glyphs in both themes", async () => {
+  const transform = await transformerSetup();
+  for (const [name, lead, solo, rest, id, head, rail] of [
+    ["dark", "#E8ECEA", "#D9DFDD", "#8E999C", "#D6CBB2", "#B3A785", "#4F5550"],
+    ["light", "#243135", "#344449", "#5C696D", "#756344", "#766C55", "#8C8574"],
+  ]) {
+    agent.initTheme(name, false);
+    const ctx = { messageType: "assistant", availableWidth: 30, isStreaming: false };
+    const paired = transform("*先检查字段，继续核对很长的中文说明与 sessionName 并确认结果。*", ctx);
+    assert.ok(paired.includes(theme.style("先检查字段，", { fg: tui.parseColor(lead), bold: false })));
+    assert.ok(paired.includes(theme.style("sessionName", { fg: tui.parseColor(id), bold: false })));
+    assert.ok(paired.includes(theme.style("▎ ", { fg: tui.parseColor(head) })));
+    assert.ok(paired.includes(theme.style("▎ ", { fg: tui.parseColor(rail) })));
+    assert.ok(paired.includes(theme.style("继续核对很长的中文说明与 ", { fg: tui.parseColor(rest), bold: false }).slice(0, 19)));
+    assert.doesNotMatch(paired, /\x1b\[1m|│/);
+    const one = transform("*正在检查配置。*", ctx);
+    assert.ok(one.includes(theme.style("正在检查配置。", { fg: tui.parseColor(solo), bold: false })));
+    assert.doesNotMatch(one, /\x1b\[1m/);
+    assert.equal(transform("**最终答复保持粗体。**", ctx), "**最终答复保持粗体。**");
+    const tool = component("read", { path: "normal.md" });
+    assert.doesNotMatch(tool.render(132).join("\n"), /\x1b\[1m/);
+  }
+  agent.initTheme("dark", false);
+});
+
+test("K keeps two rows before a separate narration and the configured intra gap after it", async () => {
+  await transformerSetup();
+  const a = await stage(assistantCalls(["boundary-a"]).content);
+  const explanation = await stage([narration("下一步")]);
+  const b = await stage(assistantCalls(["boundary-b"]).content);
+  const before = JSON.stringify([a.message, explanation.message, b.message]);
+  assert.deepEqual(visibleGaps([...a.items, ...explanation.items, ...b.items]), [2, INTRA_GAP]);
+  assert.equal(JSON.stringify([a.message, explanation.message, b.message]), before);
+});
+
+test("L repeats only consecutive done tools and invalidates cached peer rows on status changes", async () => {
+  await transformerSetup();
+  const sample = await stage([narration("检查文件"), ...assistantCalls(["ditto-a", "ditto-b", "ditto-c"]).content]);
+  const names = () => summaryRows(sample.tools[0], 132).map(row => row.trim().split(/\s+/).at(-1));
+  assert.deepEqual(names(), ["read", ENABLE_DITTO ? "·" : "read", ENABLE_DITTO ? "·" : "read"]);
+  sample.tools[0].updateResult(goodResult(), true);
+  assert.deepEqual(names(), ["[pending]", "read", ENABLE_DITTO ? "·" : "read"]);
+  sample.tools[0].markExecutionStarted();
+  assert.deepEqual(names(), ["[running]", "read", ENABLE_DITTO ? "·" : "read"]);
+  sample.tools[0].updateResult({ content: [], isError: true }, false);
+  assert.deepEqual(names(), ["[error]", "read", ENABLE_DITTO ? "·" : "read"]);
+  sample.tools[0].updateResult(goodResult(), false);
+  assert.deepEqual(names(), ["read", ENABLE_DITTO ? "·" : "read", ENABLE_DITTO ? "·" : "read"]);
+  sample.tools[1].updateResult(goodResult(), true);
+  assert.deepEqual(names(), ["read", "[pending]", "read"]);
+  sample.tools[1].updateResult(goodResult(), false);
+  const next = await stage([narration("新节点"), ...assistantCalls(["ditto-new"]).content]);
+  assert.match(summaryRows(next.tools[0], 132)[0], /read$/);
+  for (const tool of sample.tools) tool.setExpanded(true);
+  assert.equal(transcript(sample.tools).map(tui.stripTerminalSequences).join("\n").split("original-line-119").length - 1, 3);
+  for (const tool of sample.tools) tool.setExpanded(false);
+  assert.deepEqual(names(), ["read", ENABLE_DITTO ? "·" : "read", ENABLE_DITTO ? "·" : "read"]);
+});
+
+test("L resets on a tool switch and restores ditto metadata from the active branch", async () => {
+  await transformerSetup();
+  const content = assistantCalls(["switch-read-a", "switch-bash", "switch-read-b", "switch-read-c"]).content;
+  content[1] = { ...content[1], name: "bash", arguments: { command: "git status --short" } };
+  const sample = await stage([narration("检查切换"), ...content]);
+  const branch = [{ type: "message", message: sample.message }];
+  const before = JSON.stringify(branch);
+  for (const event of ["session_start", "session_tree", "session_compact"]) {
+    await extension.handlers.get(event)[0]({}, { mode: "tui", sessionManager: { getBranch: () => branch }, ui: { theme, setToolsExpanded() {}, setHiddenThinkingLabel() {} } });
+    const tools = content.map(call => { const tool = component(call.name, call.arguments, undefined, { callId: call.id }); tool.updateResult(goodResult(), false); return tool; });
+    assert.deepEqual(summaryRows(tools[0], 132).map(row => row.trim().split(/\s+/).at(-1)), ["read", "bash", "read", ENABLE_DITTO ? "·" : "read"]);
+  }
+  assert.equal(JSON.stringify(branch), before);
+});
+
+test("L applies to real codemode records without hiding calls, states, parameters or details", async () => {
+  await transformerSetup();
+  const calls = ["a", "b", "c"].map(id => ({ name: "read", args: JSON.stringify({ path: `nested-${id}.md` }), status: "ok" }));
+  const result = { content: [{ type: "text", text: "NESTED_RAW_RESULT" }], details: { calls } };
+  const before = JSON.stringify(result);
+  const item = component("codemode", { code: "await tools.read();" });
+  item.updateResult(result, false);
+  const names = () => summaryRows(item, 132).slice(1).map(row => row.trim().split(/\s+/).at(-1));
+  assert.deepEqual(names(), ["read", ENABLE_DITTO ? "·" : "read", ENABLE_DITTO ? "·" : "read"]);
+  const changed = structuredClone(result); changed.details.calls[1].status = "error";
+  item.updateResult(changed, false);
+  assert.deepEqual(names(), ["read", "[failed]", "read"]);
+  item.updateResult(result, false);
+  item.setExpanded(true);
+  assert.match(lines(item, 320), /nested-a.md[\s\S]*nested-b.md[\s\S]*nested-c.md/);
+  assert.match(lines(item), /NESTED_RAW_RESULT/);
+  item.setExpanded(false);
+  assert.deepEqual(names(), ["read", ENABLE_DITTO ? "·" : "read", ENABLE_DITTO ? "·" : "read"]);
+  assert.equal(JSON.stringify(result), before);
+});
+
+test("session teardown, stale runtime invalidation and subsequent restore keep rendering safe", async () => {
+  await resetGroups();
+  const context = { mode: "tui", sessionManager: { getBranch: () => [] }, ui: { theme, setToolsExpanded() {}, setHiddenThinkingLabel() {}, notify() {} } };
+  await extension.handlers.get("session_start")[0]({}, context);
+
+  const id = "stale-safe";
+  const message = {
+    role: "assistant", stopReason: "toolUse",
+    content: [{ type: "text", text: "*执行检查。*" }, { type: "toolCall", id, name: "read", arguments: { path: "stale-safe.md" } }],
+  };
+  await observe({ role: "assistant", content: [] }, "message_start");
+  await observe(message);
+  await observe(message, "message_end");
+  const item = component("read", { path: "stale-safe.md" }, undefined, { callId: id });
+  item.updateResult(goodResult(), false);
+
+  assert.equal(item.render(80).length, 1 + INTRA_GAP);
+  assert.match(lines(item), /stale-safe\.md/);
+
+  // 1. Session shutdown fires upon switchSession / newSession / reload
+  await extension.handlers.get("session_shutdown")[0]({ reason: "switch" }, context);
+
+  // 2. Mark runtime stale as host does on session disposal
+  const staleMarker = "This extension ctx is stale after session replacement or reload.";
+  loaded.runtime.invalidate(staleMarker);
+  assert.throws(() => loaded.runtime.assertActive(), new RegExp(staleMarker));
+
+  // 3. Old component redraw must not throw even if rendered after invalidation
+  assert.doesNotThrow(() => {
+    const rows = item.render(80);
+    assert.ok(rows.length >= 1);
+    assert.match(rows.map(tui.stripTerminalSequences).join("\n"), /stale-safe\.md/);
+  });
+
+  // 4. Progress command must also safely handle stale settings without crashing
+  const progressCmd = extension.commands.get("progress");
+  assert.ok(progressCmd);
+  let notified = false;
+  await assert.doesNotReject(async () => {
+    await progressCmd.handler("status", { ui: { notify: () => { notified = true; } }, mode: "tui" });
+  });
+  assert.ok(notified);
+
+  // 5. Subsequent session_start / tree restores normal operation for new session
+  const newBranch = [
+    { type: "message", message: { role: "assistant", content: [{ type: "toolCall", id: "fresh-call", name: "read", arguments: { path: "fresh.md" } }] } },
+  ];
+  await extension.handlers.get("session_start")[0]({}, { ...context, sessionManager: { getBranch: () => newBranch } });
+  const freshItem = component("read", { path: "fresh.md" }, undefined, { callId: "fresh-call" });
+  freshItem.updateResult(goodResult(), false);
+  assert.match(lines(freshItem), /fresh\.md/);
 });

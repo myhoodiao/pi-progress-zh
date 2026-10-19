@@ -1,16 +1,27 @@
 import { posix, win32 } from "node:path";
 import { VERSION, type ExtensionAPI, type MarkdownTransformContext, type Theme, type ToolRenderContext, type ToolRenderers } from "@earendil-works/pi-coding-agent";
-import { Box, Container, Spacer, Text, parseColor, sliceByColumn, stripTerminalSequences, truncateToWidth, visibleWidth, wrapTextWithAnsi, type Component } from "@earendil-works/pi-tui";
+import { Box, Container, Spacer, Text, parseColor, stripTerminalSequences, truncateToWidth, visibleWidth, wrapTextWithAnsi, type Component } from "@earendil-works/pi-tui";
 
-export const PLUGIN_VERSION = "0.9.0";
+export const PLUGIN_VERSION = "0.10.0";
 export const TESTED_PI_VERSION = "1.3.0";
 const STAGE_GAP = 2;
+// Independent visual options: G+H+I+J uses INTRA_GAP = 2 and ENABLE_DITTO = false.
+const INTRA_GAP = 2; // K: set to 1 for tighter spacing within a narration node.
+const ENABLE_DITTO = false; // L: repeated completed tools in the same group use ·.
 const FILE_COLOR = parseColor("#C9BA9A");
-const NEUTRAL_DARK = parseColor("#AEB8BA");
-const NEUTRAL_LIGHT = parseColor("#566367");
+const NEUTRAL_DARK = parseColor("#B5BEBF");
+const NEUTRAL_LIGHT = parseColor("#3E4E53");
+const DIR_FILE_DARK = parseColor("#8E846E");
+const DIR_FILE_LIGHT = parseColor("#8C826E");
+const DIR_DARK = parseColor("#7A8588");
+const DIR_LIGHT = parseColor("#687377");
+const RANGE_DARK = parseColor("#6E797C");
+const RANGE_LIGHT = parseColor("#687377");
+const SEP_DARK = parseColor("#5F696C");
+const SEP_LIGHT = parseColor("#788286");
 const SOFT_ERROR_DARK = parseColor("#D99083");
 const SOFT_ERROR_LIGHT = parseColor("#A65B52");
-const RAIL_DARK = parseColor("#6F746B");
+const RAIL_DARK = parseColor("#4F5550");
 const RAIL_LIGHT = parseColor("#8C8574");
 export const NARRATION_RULES = [
   "任务过程说明：所有面向用户的节点说明必须使用简体中文，命令、路径和代码标识符保留原文。处理需要操作的任务时，在开始、关键发现、方向调整和进入验证等有意义的节点，用普通可见助手文字给用户一至两句简体中文说明。说明当前判断或事实及下一步，用非专业用户能理解的表达；不要引用、翻译或展示原生 thinking。每条说明独立成段，用单个星号包住整个段落（*说明文字*），段内不要再加 Markdown 格式。最终答复正常排版，不使用整段斜体的说明格式。",
@@ -54,12 +65,42 @@ function stateOf(context: ToolRenderContext): string {
 function background(context: ToolRenderContext) {
   return context.isPartial ? "toolPendingBg" : context.isError ? "toolErrorBg" : "toolSuccessBg";
 }
+/** Remove shell display escapes and edge quotes, never ordinary path/regexp backslashes. */
+function cleanDisplayToken(raw: string): string {
+  let text = raw.replace(/\\(["$])/g, "$1");
+  const pair = text.match(/^(['"])(.*)\1$/);
+  if (pair && text.length > 1) text = pair[2];
+  for (const quote of ["'", '"']) {
+    if ((text.split(quote).length - 1) % 2) {
+      if (text.startsWith(quote)) text = text.slice(1);
+      if (text.endsWith(quote)) text = text.slice(0, -1);
+    }
+  }
+  return text;
+}
 function middlePath(text: string, width: number): string {
   if (visibleWidth(text) <= width) return text;
   if (width <= 1) return truncateToWidth(text, width, "…");
-  const endWidth = Math.min(width - 1, Math.max(visibleWidth(text.split(/[\\/]/).pop() ?? ""), Math.floor(width * 0.65)));
-  const headWidth = width - endWidth - 1;
-  return `${sliceByColumn(text, 0, headWidth, true)}…${sliceByColumn(text, visibleWidth(text) - endWidth, endWidth, true)}`;
+  const range = text.match(/:\d+(?:-\d+)?$/)?.[0] ?? "";
+  const body = range ? text.slice(0, -range.length) : text;
+  const sep = body.match(/[\\/]/)?.[0];
+  if (sep) {
+    const segs = body.split(/[\\/]/);
+    const last = segs.at(-1)! + range;
+    let candidate = `${segs[0]}${sep}…${sep}${last}`;
+    if (visibleWidth(candidate) <= width) {
+      const tail = [last];
+      for (let index = segs.length - 2; index > 0; index--) {
+        const next = `${segs[0]}${sep}…${sep}${segs[index]}${sep}${tail.join(sep)}`;
+        if (visibleWidth(next) > width) break;
+        tail.unshift(segs[index]); candidate = next;
+      }
+      return candidate;
+    }
+    candidate = `…${sep}${last}`;
+    if (visibleWidth(candidate) <= width) return candidate;
+  }
+  return truncateToWidth(text, width, "…");
 }
 /** Display-only path labels; no filesystem access or changes to tool arguments. */
 class PathLabels {
@@ -496,18 +537,20 @@ function excerptIsRedundant(targetText: string, excerptText: string, continuatio
   // A pipe or meaningful arguments stay; only continuation markers are dropped.
   return rest === "" || /^(?:&&|;|…|\.{3})[\s…;|&.]*$/.test(rest);
 }
-/** C collapses a trailing `; …` after an existing ellipsis; no source text changes. */
+/** C/H collapse trailing continuation ellipses; no source text changes. */
 function tidyExcerpt(text: string): string {
   return text
     .replace(/\s*;\s*…\s*$/, " …")
-    .replace(/(?:…\s*){2,}$/, "…");
+    .replace(/(?:(?:\.{3}|…)\s*){2,}$/, "…");
 }
 /** Width is resolved during render, rather than limiting JavaScript character counts. */
 class SummaryLine implements Component {
   private segments: (Omit<SummarySegment, "text"> & { text: () => string })[];
-  constructor(private summary: Summary, private status: string, private theme: Theme, cwd = "", paths?: PathLabels) {
+  constructor(private summary: Summary, private status: string, private theme: Theme, cwd = "", paths?: PathLabels,
+    private sameTool: () => boolean = () => false) {
     this.segments = (summary.segments ?? [{ text: summary.detail, path: summary.path }]).map(segment => {
-      const label = segment.path && paths ? paths.label(segment.text, cwd) : () => segment.text;
+      const text = cleanDisplayToken(segment.text);
+      const label = segment.path && paths ? paths.label(text, cwd) : () => text;
       return { ...segment, text: () => label() + (segment.suffix ?? "") };
     });
   }
@@ -524,44 +567,79 @@ class SummaryLine implements Component {
     const suffixStyled = !suffix ? "" : errorState
       ? this.theme.style(suffix, { fg: this.theme.appearance === "light" ? SOFT_ERROR_LIGHT : SOFT_ERROR_DARK })
       : this.theme.fg(this.status === "running" ? "warning" : "dim", suffix);
-    const typeWidth = visibleWidth(title) + 2;
+    const ditto = this.status === "done" && this.sameTool();
+    const displayTitle = ditto ? "·" : title;
+    const typeWidth = visibleWidth(displayTitle) + 2;
     // In narrow windows, give the target and explicit state priority over the type label.
     const targetFloor = Math.min(24, Math.max(8, ...segments.filter(segment => segment.path || segment.reference).map(segment => visibleWidth(segment.text.split(/[\\/]/).pop() ?? ""))));
     const showType = width - typeWidth - visibleWidth(suffix) >= targetFloor;
-    const type = showType ? this.theme.style(`  ${title}`, { fg: parseColor(this.theme.appearance === "light" ? "#566367" : "#838D91") }) : "";
+    const light = this.theme.appearance === "light";
+    const sepColor = light ? SEP_LIGHT : SEP_DARK;
+    const typeColor = ditto ? light ? RAIL_LIGHT : parseColor("#4C524D") : parseColor(light ? "#667377" : "#687478");
+    const type = showType ? this.theme.style(`  ${displayTitle}`, { fg: typeColor }) : "";
     const meta = `${type}${suffixStyled}`;
     const metaWidth = visibleWidth(meta);
     const targetText = segments.map(segment => segment.text).join("");
-    let remaining = Math.max(0, width - metaWidth);
-    const rendered: string[] = [];
-    for (let index = 0; index < segments.length; index++) {
-      const segment = segments[index];
-      if (remaining < 1) break;
-      const laterTargets = segments.slice(index + 1).filter(next => next.path);
-      const reserve = laterTargets.length ? Math.min(Math.floor(remaining * 0.6), laterTargets.reduce((n, next) => n + Math.min(16, visibleWidth(next.text)) + 2, 0)) : 0;
-      const available = remaining - reserve;
-      const text = visibleWidth(segment.text) > available
-        ? segment.path || segment.reference ? middlePath(segment.text, available) : truncateToWidth(segment.text, available, "…")
-        : segment.text;
-      rendered.push(this.theme.style(text, { fg: segment.file || this.summary.fileTitle ? FILE_COLOR : parseColor(this.theme.appearance === "light" ? "#344449" : "#D1D6D4"), bold: true }));
-      remaining -= visibleWidth(text);
-      if (visibleWidth(segment.text) > visibleWidth(text) && !laterTargets.length) break;
+    const available = Math.max(0, width - metaWidth);
+    // H lays out complete logical items in plain text before G applies ANSI colors.
+    const items: SummarySegment[][] = [[]];
+    for (const segment of segments) {
+      if (segment.text === ", ") items.push([]);
+      else items[items.length - 1].push(segment);
     }
-    const target = rendered.join("");
+    const fitItem = (item: SummarySegment[], budget: number, multi: boolean): SummarySegment[] => {
+      let remaining = budget;
+      return item.map(segment => {
+        const path = /[\\/]/.test(segment.text);
+        const limit = Math.max(0, multi && path ? Math.min(46, remaining) : remaining);
+        const text = path || segment.path || segment.reference ? middlePath(segment.text, limit) : truncateToWidth(segment.text, limit, "…");
+        remaining = Math.max(0, remaining - visibleWidth(text));
+        return { ...segment, text };
+      });
+    };
+    const chosen: SummarySegment[][] = [];
+    let usedWidth = 0;
+    for (let index = 0; index < items.length; index++) {
+      const reserve = index < items.length - 1 ? visibleWidth(`  +${items.length - index}`) : 0;
+      const item = items.length === 1 ? fitItem(items[index], available, false)
+        : items[index].map(segment => /[\\/]/.test(segment.text)
+          ? { ...segment, text: middlePath(segment.text, Math.min(46, available)) } : segment);
+      const itemWidth = item.reduce((sum, segment) => sum + visibleWidth(segment.text), 0);
+      if (usedWidth + (chosen.length ? 2 : 0) + itemWidth + reserve > available) {
+        if (!chosen.length) chosen.push(fitItem(items[0], Math.max(1, available - reserve), items.length > 1));
+        break;
+      }
+      usedWidth += (chosen.length ? 2 : 0) + itemWidth;
+      chosen.push(item);
+    }
+    const styleSegment = (segment: SummarySegment): string => {
+      const file = segment.file || this.summary.fileTitle;
+      const baseColor = file ? light ? parseColor("#756344") : FILE_COLOR : light ? NEUTRAL_LIGHT : NEUTRAL_DARK;
+      const style = (text: string, fg: ReturnType<typeof parseColor>) => this.theme.style(text, { fg, bold: false });
+      if (!(segment.path || segment.reference || /[\\/]/.test(segment.text))) return style(segment.text, baseColor);
+      const range = segment.text.match(/:\d+(?:-\d+)?$/)?.[0] ?? "";
+      const body = range ? segment.text.slice(0, -range.length) : segment.text;
+      const index = Math.max(body.lastIndexOf("/"), body.lastIndexOf("\\"));
+      const split = index >= 0 && index < body.length - 1 ? index + 1 : 0;
+      return style(body.slice(0, split), file ? light ? DIR_FILE_LIGHT : DIR_FILE_DARK : light ? DIR_LIGHT : DIR_DARK)
+        + style(body.slice(split), baseColor) + style(range, light ? RANGE_LIGHT : RANGE_DARK);
+    };
+    const target = chosen.map(item => item.map(styleSegment).join("")).join(this.theme.style(", ", { fg: sepColor }))
+      + (chosen.length < items.length ? this.theme.style(`  +${items.length - chosen.length}`, { fg: sepColor }) : "");
     // A puts the type and state on one right edge while short targets keep a gap.
     const align = visibleWidth(target) > 0 && metaWidth > 0;
     const padding = align ? " ".repeat(Math.max(0, width - metaWidth - visibleWidth(target))) : "";
     const row = truncateToWidth(`${target}${padding}${meta}`, width, "…");
     const lines = [row];
-    const excerptSource = preview?.length ? previewText(preview, 10000) : subline ?? "";
+    const excerptSource = cleanDisplayToken(preview?.length ? previewText(preview, 10000) : subline ?? "");
     // F omits a second line that only repeats the target or its continuation.
     if (!excerptIsRedundant(targetText, excerptSource, continuation) && (subline || preview?.length) && width > 2) {
       const tail = truncateToWidth(continuation, width - 2, "…");
       const budget = Math.max(0, width - 2 - (tail ? visibleWidth(tail) + 1 : 0));
-      const excerpt = preview?.length ? previewText(preview, budget) : truncateToWidth(subline!, budget, "…");
-      const text = tidyExcerpt(`${excerpt}${tail ? ` ${tail}` : ""}`);
+      const excerpt = preview?.length ? cleanDisplayToken(previewText(preview, budget)) : truncateToWidth(excerptSource, budget, "…");
+      const text = tidyExcerpt(`${cleanDisplayToken(excerpt)}${tail ? ` ${tail}` : ""}`);
       const connector = this.theme.style("└ ", { fg: this.theme.appearance === "light" ? RAIL_LIGHT : RAIL_DARK });
-      lines.push(connector + this.theme.style(text, { fg: this.theme.appearance === "light" ? NEUTRAL_LIGHT : parseColor("#929EA2") }));
+      lines.push(connector + this.theme.style(text, { fg: parseColor(light ? "#5E6B6F" : "#7B878A") }));
     }
     return lines;
   }
@@ -628,6 +706,8 @@ interface GroupRow {
   call: Component;
   result: Component;
   context: ToolRenderContext;
+  title?: string;
+  status?: string;
 }
 interface SpacingMessage { message: any; }
 interface ToolGroup { ids: string[]; rows: Map<string, GroupRow>; invalidating: boolean; before: SpacingMessage[]; following: SpacingMessage[]; }
@@ -636,6 +716,7 @@ interface ToolGroup { ids: string[]; rows: Map<string, GroupRow>; invalidating: 
  * Unknown/interleaved/error layouts retain the native spacing instead of guessing.
  */
 function missingStageRows(following: readonly SpacingMessage[], hiddenThinking: boolean, afterText = false): number {
+  const targetGap = afterText ? INTRA_GAP : STAGE_GAP;
   let blanks = 0;
   let sawText = !afterText;
   const visible = (part: any) => (part.type === "text" && part.text?.trim()) || (part.type === "thinking" && part.thinking?.trim());
@@ -648,11 +729,11 @@ function missingStageRows(following: readonly SpacingMessage[], hiddenThinking: 
     for (let index = 0; index < parts.length; index++) {
       const part = parts[index];
       if (part.type === "text" && part.text?.trim()) {
-        if (!afterText) return Math.max(0, STAGE_GAP - blanks);
+        if (!afterText) return Math.max(0, targetGap - blanks);
         sawText = true;
         blanks = 0; // Measure only the gap after the latest visible explanation.
       }
-      if (part.type === "toolCall") return sawText ? Math.max(0, STAGE_GAP - blanks - 1) : 0; // Native tool spacer.
+      if (part.type === "toolCall") return sawText ? Math.max(0, targetGap - blanks - 1) : 0; // Native tool spacer.
       if (part.type !== "thinking") continue;
       let nonempty = false;
       for (; index < parts.length && parts[index].type === "thinking"; index++) nonempty ||= Boolean(parts[index].thinking?.trim());
@@ -674,13 +755,20 @@ class ToolGroups {
   private spacingMessage?: SpacingMessage;
   private spacingOwner?: ToolGroup;
   private beforeTool: SpacingMessage[] = [];
+  private disposed = false;
   constructor(private hiddenThinking: () => boolean) {}
   clear() {
+    this.disposed = true;
+    for (const group of this.groups.values()) {
+      group.before = [];
+      group.following = [];
+    }
     this.groups.clear(); this.active = undefined;
     this.spacingTail = undefined; this.spacingMessage = undefined; this.spacingOwner = undefined;
     this.beforeTool = [];
   }
   begin(message: any) {
+    this.disposed = false;
     // Tool results sit between assistant responses and do not start a new stage.
     if (message?.role === "toolResult") return;
     this.spacingMessage = undefined;
@@ -693,6 +781,7 @@ class ToolGroups {
   }
   restore(entries: readonly any[]) {
     this.clear();
+    this.disposed = false;
     for (const entry of entries) {
       if (entry.type !== "message") { this.begin(undefined); continue; }
       this.begin(entry.message);
@@ -730,7 +819,7 @@ class ToolGroups {
     if (group.invalidating) return;
     group.invalidating = true;
     try {
-      for (const id of new Set([group.ids[0], group.ids[group.ids.length - 1]])) {
+      for (const id of ENABLE_DITTO ? group.ids : new Set([group.ids[0], group.ids[group.ids.length - 1]])) {
         const row = group.rows.get(id);
         if (row && id !== sender) {
           try { row.context.invalidate(); } catch { /* A detached view needs no repaint. */ }
@@ -743,63 +832,77 @@ class ToolGroups {
     return VERSION === TESTED_PI_VERSION && [...group.rows.values()].every(row => !row.context.expanded && !(row.context.showImages && row.context.state[imageSlot]));
   }
   private paddingAfter(group: ToolGroup): number {
-    if (!this.spacingEnabled(group) || group.following.length === 0) return 0;
+    if (this.disposed || !this.spacingEnabled(group) || group.following.length === 0) return 0;
     return missingStageRows(group.following, this.hiddenThinking());
   }
   private paddingBefore(group: ToolGroup): number {
-    if (!this.spacingEnabled(group) || group.before.length === 0) return 0;
+    if (this.disposed || !this.spacingEnabled(group) || group.before.length === 0) return 0;
     return missingStageRows(group.before, this.hiddenThinking(), true);
   }
-  wrap(context: ToolRenderContext, slot: "call" | "result", component: Component): Component {
+  isSameToolAsPrevious(toolCallId: string, title: string, status: string): boolean {
+    if (!ENABLE_DITTO || this.disposed || status !== "done") return false;
+    const group = this.groups.get(toolCallId);
+    const index = group?.ids.indexOf(toolCallId) ?? -1;
+    if (!group || index <= 0) return false;
+    const previous = group.rows.get(group.ids[index - 1]);
+    return previous?.status === "done" && previous.title === title;
+  }
+  wrap(context: ToolRenderContext, slot: "call" | "result", component: Component, title?: string): Component {
     const group = this.groups.get(context.toolCallId);
     if (!group) return component;
     const row = group.rows.get(context.toolCallId) ?? { id: context.toolCallId, call: new Container(), result: new Container(), context };
     row.context = context;
+    if (title !== undefined) row.title = title;
+    row.status = stateOf(context);
     row[slot] = component;
     group.rows.set(row.id, row);
     this.refresh(group, row.id);
     return new GroupSlot(group, row, slot, () => this.paddingAfter(group),
-      () => this.paddingBefore(group), () => this.spacingEnabled(group) ? STAGE_GAP : 0);
+      () => this.paddingBefore(group), () => this.spacingEnabled(group) ? INTRA_GAP : 0);
   }
 }
 /** Empty peer slots let Pi omit their shells; expansion keeps each native tool in place. */
 class GroupSlot implements Component {
   constructor(private group: ToolGroup, private row: GroupRow, private slot: "call" | "result", private paddingAfter: () => number,
     private paddingBefore: () => number, private betweenRows: () => number) {}
-  invalidate() { this.row[this.slot].invalidate?.(); }
+  invalidate() { try { this.row[this.slot].invalidate?.(); } catch { /* Ignore detached view. */ } }
   render(width: number): string[] {
-    const grouped = this.group.ids.length > 1 && this.group.ids.includes(this.row.id)
-      && [...this.group.rows.values()].every(row => !row.context.expanded && !row.context.showImages);
-    if (!grouped) {
-      const lines = [...this.row[this.slot].render(width)];
-      if (this.slot === "call" && lines.length) {
-        const before = this.row.id === this.group.ids[0] ? this.paddingBefore() : Math.max(0, this.betweenRows() - 1);
-        lines.unshift(...Array(before).fill("")); // Independent tool shells already provide one blank row.
+    try {
+      const grouped = this.group.ids.length > 1 && this.group.ids.includes(this.row.id)
+        && [...this.group.rows.values()].every(row => !row.context.expanded && !row.context.showImages);
+      if (!grouped) {
+        const lines = [...this.row[this.slot].render(width)];
+        if (this.slot === "call" && lines.length) {
+          const before = this.row.id === this.group.ids[0] ? this.paddingBefore() : Math.max(0, this.betweenRows() - 1);
+          lines.unshift(...Array(before).fill("")); // Independent tool shells already provide one blank row.
+        }
+        return this.slot === "result" && this.row.id === this.group.ids[this.group.ids.length - 1]
+          ? [...lines, ...Array(this.paddingAfter()).fill("")] : lines;
       }
-      return this.slot === "result" && this.row.id === this.group.ids[this.group.ids.length - 1]
-        ? [...lines, ...Array(this.paddingAfter()).fill("")] : lines;
-    }
-    if (this.row.id !== this.group.ids[0] || this.slot !== "call") return [];
-    const lines: string[] = [];
-    for (const id of this.group.ids) {
-      const row = this.group.rows.get(id);
-      if (row) {
-        const content = [...row.call.render(width), ...row.result.render(width)];
-        if (content.length) {
-          lines.push(...Array(lines.length ? this.betweenRows() : this.paddingBefore()).fill(""));
-          lines.push(...content);
+      if (this.row.id !== this.group.ids[0] || this.slot !== "call") return [];
+      const lines: string[] = [];
+      for (const id of this.group.ids) {
+        const row = this.group.rows.get(id);
+        if (row) {
+          const content = [...row.call.render(width), ...row.result.render(width)];
+          if (content.length) {
+            lines.push(...Array(lines.length ? this.betweenRows() : this.paddingBefore()).fill(""));
+            lines.push(...content);
+          }
         }
       }
+      lines.push(...Array(this.paddingAfter()).fill(""));
+      return lines;
+    } catch {
+      try { return [...this.row[this.slot].render(width)]; } catch { return []; }
     }
-    lines.push(...Array(this.paddingAfter()).fill(""));
-    return lines;
   }
   handleMouse(event: any) { return (this.row[this.slot] as any).handleMouse?.(event); }
 }
 
 /** Only rendering changes; execution, arguments and stored results stay with Pi. */
 export function quietRenderers(toolName: string, original?: ToolRenderers, groups?: ToolGroups, paths = new PathLabels()): ToolRenderers {
-  const wrap = (context: ToolRenderContext, slot: "call" | "result", component: Component) => groups?.wrap(context, slot, component) ?? component;
+  const wrap = (context: ToolRenderContext, slot: "call" | "result", component: Component, title?: string) => groups?.wrap(context, slot, component, title) ?? component;
   return {
     renderShell: "self",
     renderCall(args, theme, context) {
@@ -811,13 +914,17 @@ export function quietRenderers(toolName: string, original?: ToolRenderers, group
         if (!native) return wrap(context, "call", fallback);
         return wrap(context, "call", new SafeNative(original?.renderShell === "self" ? native : framed(native, theme, context), fallback));
       }
-      return wrap(context, "call", framed(new SummaryLine(summarize(toolName, args, native, context.cwd), stateOf(context), theme, context.cwd, paths), theme, context, true));
+      const summary = summarize(toolName, args, native, context.cwd);
+      const status = stateOf(context);
+      return wrap(context, "call", framed(new SummaryLine(summary, status, theme, context.cwd, paths,
+        () => groups?.isSameToolAsPrevious(context.toolCallId, summary.title, status) ?? false), theme, context, true), summary.title);
     },
     renderResult(result, options, theme, context) {
       context.state[imageSlot] = result.content.some(part => part.type === "image");
       if (!options.expanded) {
         if (toolName !== "codemode" || !Array.isArray(result.details?.calls)) return wrap(context, "result", new Container());
         const rows = new Container();
+        let prevTitle = "", prevStatus = "";
         for (const call of result.details.calls) {
           if (!call || typeof call.name !== "string") continue;
           const status = ({ running: "running", ok: "done", error: "failed", cancelled: "cancelled" } as Record<string, string>)[call.status] ?? "pending";
@@ -827,8 +934,10 @@ export function quietRenderers(toolName: string, original?: ToolRenderers, group
           const summary = args && typeof args === "object" ? summarize(call.name, args, undefined, context.cwd)
             : ["read", "edit", "write", "ls", "grep", "find"].includes(call.name) ? fileSummary(clean(call.name), clean(call.args))
             : { title: clean(call.name), detail: clean(call.args), path: false };
-          if (VERSION === TESTED_PI_VERSION && !(context.showImages && context.state[imageSlot])) rows.addChild(new Spacer(STAGE_GAP));
-          rows.addChild(framed(new SummaryLine(summary, status, theme), theme, rowContext, true));
+          const ditto = ENABLE_DITTO && status === "done" && prevStatus === "done" && summary.title === prevTitle;
+          if (VERSION === TESTED_PI_VERSION && !(context.showImages && context.state[imageSlot])) rows.addChild(new Spacer(INTRA_GAP));
+          rows.addChild(framed(new SummaryLine(summary, status, theme, context.cwd, paths, () => ditto), theme, rowContext, true));
+          prevTitle = summary.title; prevStatus = status;
         }
         return wrap(context, "result", rows);
       }
@@ -845,27 +954,28 @@ export function quietRenderers(toolName: string, original?: ToolRenderers, group
 
 function narrationParagraph(text: string, width: number, theme: Theme): string {
   const light = theme.appearance === "light";
-  const leadColor = parseColor(light ? "#344449" : "#D2DAD9");
-  const restColor = parseColor(light ? "#566367" : "#949EA2");
-  const idColor = parseColor(light ? "#756344" : "#D4CAB5");
-  const markColor = parseColor(light ? "#766C55" : "#898272");
+  const leadColor = parseColor(light ? "#243135" : "#E8ECEA");
+  const soloColor = parseColor(light ? "#344449" : "#D9DFDD");
+  const restColor = parseColor(light ? "#5C696D" : "#8E999C");
+  const idColor = parseColor(light ? "#756344" : "#D6CBB2");
+  const markColor = parseColor(light ? "#766C55" : "#B3A785");
   const railColor = light ? RAIL_LIGHT : RAIL_DARK;
   const raw = stripTerminalSequences(text).replace(/`([^`]+)`/g, "$1");
   const hit = raw.search(/[，；]/), split = hit < 0 ? raw.length : hit + 1;
   const head = raw.slice(0, split), tail = raw.slice(split);
   const prefixWidth = width > 2 ? 2 : 0;
   const bodyWidth = Math.max(1, Math.min(68, width - prefixWidth));
-  const style = (value: string, color: ReturnType<typeof parseColor>, bold = false) => value.split(/([A-Za-z_][A-Za-z0-9_]*)/g)
-    .map((part, index) => theme.style(part, { fg: index % 2 ? idColor : color, bold })).join("");
+  const style = (value: string, color: ReturnType<typeof parseColor>) => value.split(/([A-Za-z_][A-Za-z0-9_]*)/g)
+    .map((part, index) => theme.style(part, { fg: index % 2 ? idColor : color, bold: false })).join("");
   const breakTail = head.endsWith("；") && visibleWidth(raw) > 56;
-  const parts = breakTail ? [{ text: style(head, leadColor, true), indent: 0 }, { text: style(tail, restColor), indent: 2 }]
-    : [{ text: style(head, leadColor, true) + style(tail, restColor), indent: 0 }];
+  const parts = breakTail ? [{ text: style(head, leadColor), indent: 0 }, { text: style(tail, restColor), indent: 2 }]
+    : [{ text: style(head, hit < 0 ? soloColor : leadColor) + style(tail, restColor), indent: 0 }];
   const lines: string[] = [];
   for (const part of parts) {
     if (!stripTerminalSequences(part.text)) continue;
     const indent = Math.min(part.indent, bodyWidth - 1);
     for (const line of wrapTextWithAnsi(part.text, Math.max(1, bodyWidth - indent))) {
-      const prefix = prefixWidth ? !lines.length ? theme.style("▎ ", { fg: markColor }) : theme.style("│ ", { fg: railColor }) : "";
+      const prefix = prefixWidth ? !lines.length ? theme.style("▎ ", { fg: markColor }) : theme.style("▎ ", { fg: railColor }) : "";
       // Escape Markdown punctuation after width-aware wrapping; source history is unchanged.
       lines.push(prefix + " ".repeat(indent) + line.replace(/([\\`*_])/g, "\\$1"));
     }
@@ -903,20 +1013,24 @@ export default function (pi: ExtensionAPI) {
   const supported = typeof pi.registerToolRenderer === "function";
   const markdownSupported = typeof pi.registerMarkdownTransformer === "function";
   let uiTheme: (() => Theme) | undefined;
-  const groups = new ToolGroups(() => pi.getSettings().hideThinkingBlock === true);
+  const safeGetSettings = () => {
+    try { return pi.getSettings(); } catch { return undefined; }
+  };
+  const groups = new ToolGroups(() => safeGetSettings()?.hideThinkingBlock === true);
   const paths = new PathLabels();
   pi.registerCommand("progress", {
     description: "status：查看中文过程展示状态和详情入口",
     handler: async (args, ctx) => {
       if (args.trim() && args.trim() !== "status") { ctx.ui.notify("用法：/progress status", "info"); return; }
-      const settings = pi.getSettings();
+      const settings = safeGetSettings() ?? {};
       ctx.ui.notify([
-        `中文过程展示 ${PLUGIN_VERSION}；当前 Pi ${VERSION}。两行间距适配 Pi ${TESTED_PI_VERSION}；本版采用半屏一至两行摘要、右缘元信息栏、C 目标优先、S1+S2 连续导栏与重复片段省略；实际观感待用户验收。`,
+        `中文过程展示 ${PLUGIN_VERSION}；当前 Pi ${VERSION}。间距适配 Pi ${TESTED_PI_VERSION}；当前组合 G+H+I+J${INTRA_GAP === 1 ? "+K" : ""}${ENABLE_DITTO ? "+L" : ""}，保留半屏一至两行摘要、右缘元信息栏、C 目标优先与重复片段省略；实际观感待用户验收。`,
         supported ? "有文字或 thinking 的响应在原位置显示工具摘要；空白响应仍可集中。收起态先显示目标，再在右缘显示弱化的工具名和状态；简单操作一行，复杂命令第二行显示关键动作和条件；每行连同缩进、工具名和状态不超过可用宽度的一半，未知命令也受限。显示具体对象和真实代码片段，保留原有管道或分号，不新增类别标签或箭头链；未知脚本直接保留可读的原始片段。第二行只在包含新增对象、参数或条件时显示；仅重复目标或只剩 && …、; … 时省略，Ctrl+O 仍可查看完整命令。文件目标为 #C9BA9A，错误只在末尾标柔和红色；Ctrl+O 展开原有详情。" : "公开工具渲染接口不可用，工具摘要未启用。",
-        "摘要路径：工作目录内使用相对路径，外部绝对路径优先保留末尾三级，重名时增加目录；Ctrl+O 查看原始详情。成功不显示 [done]，pending/running/error 与内部失败、取消状态仍显示。",
-        markdownSupported ? "节点说明使用 S1+S2：首行 ▎、续行 │、两列悬挂、首分句加粗提亮、后续较暗和最长 68 列正文；摘录第二行使用 └ 连接；模型未遵守格式时保留正文显示。" : "公开 Markdown 接口不可用，节点说明保留正文显示。",
+        "摘要路径：工作目录内使用相对路径，外部绝对路径优先保留末尾三级，重名时增加目录；目录与行号调暗、文件名突出，路径按目录边界折叠，多目标按整项显示并用 +N 标出省略数量。仅在收起显示层清理 shell 转义和边缘引号；Ctrl+O 查看原始详情。成功不显示 [done]，pending/running/error 与内部失败、取消状态仍显示。",
+        ENABLE_DITTO ? "同组连续相同且均已完成的工具，从第二条起右栏显示暗色 ·；工具切换、未完成、错误及新节点首条仍显示工具名。" : "右栏逐条保留完整工具名，L 同上省略未启用。",
+        markdownSupported ? "节点说明：首行和续行统一 ▎、两列悬挂、最长 68 列正文；中文与工具目标均不加粗，说明首分句提亮、后续较暗、无逗号或分号的单句使用中亮度，英文标识符独立配色；工具行降亮，摘录第二行使用 └ 连接；模型未遵守格式时保留正文显示。" : "公开 Markdown 接口不可用，节点说明保留正文显示。",
         "说明由当前主模型正常输出；插件不另发模型请求，不追加独立说明节点。",
-        VERSION === TESTED_PI_VERSION ? "间距试用：收起态说明到命令、命令之间及常见组间以 2 行空白为目标；只补不足，原生超过 2 行的保留。展开或工具组实际含可显示图片时保留原生布局。" : "当前 Pi 版本未验证间距模型，自动停用补齐；原生留白保留。",
+        VERSION === TESTED_PI_VERSION ? `间距试用：收起态说明到命令及同组命令间以 ${INTRA_GAP} 行空白为目标，跨节点保持 ${STAGE_GAP} 行；只补不足，原生超过目标的保留。展开或工具组实际含可显示图片时保留原生布局。` : "当前 Pi 版本未验证间距模型，自动停用补齐；原生留白保留。",
         "字体由终端决定；不修改 Pi 原生分隔、消息记录或 thinking。",
         `原生 thinking：${markdownSupported ? "插件仅在界面隐藏正文，原始记录保留" : settings.hideThinkingBlock ? "宿主设置隐藏" : "可见"}；工具图片：${settings.terminal?.showImages === false ? "已隐藏" : "允许显示"}。图片继续服从 Pi 原生开关。`,
         ctx.mode === "tui" ? "当前为终端界面。" : "当前不是终端界面，工具协议和原始结果仍正常输出。",
