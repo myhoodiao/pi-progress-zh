@@ -20,6 +20,10 @@
 
 它适合想关注任务进展和最终结果、又希望随时检查执行细节的 Pi CLI 使用者。
 
+## 0.10.1 更新
+
+新增 Pi `1.4.0` 的两行间距适配，同时保留 `1.3.0`。普通收起态说明到首工具、同组工具间、跨节点及 `codemode` 内部调用以两行空白为目标，只补不足，保留原生更大空白。未知 Pi 版本仍自动停用补齐；展开和实际图片边界保留原生布局。
+
 ## 0.10.0 更新
 
 当前组合为 **G+H+I+J**，按用户要求关闭 K、L；保留 A+C+F 的半屏右缘布局与重复片段省略：
@@ -35,11 +39,11 @@
 
 `index.ts` 顶部的 `INTRA_GAP` 与 `ENABLE_DITTO` 相互独立，当前为 `2` / `false`。间距只补不足，原生更大空白保留。收起、展开与图片规则不变，继续保留会话失效后的重绘防守。
 
-GitHub 安装源已更新为 `0.10.0`。已安装 GitHub 版的使用者可按下方更新命令获取新版本。
+GitHub 安装源已更新为 `0.10.1`。已安装 GitHub 版的使用者可按下方更新命令获取新版本。
 
 ## 安装
 
-需要先安装 Pi。当前组件测试适配 **Pi `1.3.0`**。
+需要先安装 Pi。当前间距适配范围为 **Pi `1.3.0` / `1.4.0`**。
 
 从公开 GitHub 仓库安装：
 
@@ -53,7 +57,7 @@ pi install git:github.com/myhoodiao/pi-progress-zh
 /progress status
 ```
 
-确认插件版本为 `0.10.0`，组合为 `G+H+I+J`，组内和跨节点均为 2 行目标，K/L 关闭，且工具摘要和中文说明接口已启用。
+确认插件版本为 `0.10.1`，组合为 `G+H+I+J`，组内和跨节点均为 2 行目标，K/L 关闭，且工具摘要和中文说明接口已启用。
 
 同一个插件只保留一种安装来源。如果已经安装了本地开发版，先用 `pi list` 核对来源，再移除旧来源，避免本地包和公开包重复加载。
 
@@ -72,14 +76,14 @@ pi install git:github.com/myhoodiao/pi-progress-zh
 
 ## 兼容范围与说明
 
-- 当前组合为 G+H+I+J，版本仍为 `0.10.0`，以 `/progress status` 的组合文案区分。本次关闭 K/L 后重新运行组件测试 **90/90 通过**；与正式实现同源的副本通过 **4/4 组 ConPTY**，覆盖 80、132、200 列、收起/展开/再收起/重开、错误及原始消息字节不变。G/H/I/J 和既有防崩溃逻辑未改；本次没有重跑真实 `/resume` 选择器和 `/reload`，仍需用户重启目视。
+- 当前组合为 G+H+I+J，版本 `0.10.1`。Pi `1.3.0` 与 `1.4.0` 的组件测试各 **91/91 通过**；Pi `1.4.0` 离线 ConPTY 修复前后对照 **4/4 通过**（图片权限开/关各一组前后对照，80/132/200 列、收起/展开/再收起/重开、错误及原始消息字节不变）。普通间距修复后均为两行，宿主原生五行空白保留。本次未重跑真实 `/resume` 选择器和 `/reload`，用户当前 Windows Terminal 进程仍需退出重启并目视验收。
 - 初次实施时，G–L、G+H+I+J 快照及 K、L 分别单独启用的配置各通过同一套 88 项测试。
 - 初次实施的离线 ConPTY：修改前、G+H+I+J、G–L 三档共 **12/12 组通过**，覆盖 80、132、200 列、收起、`Ctrl+O` 展开、再收起、重新打开会话、错误及原始消息字节不变。G–L 合成会话另通过真实 `/resume` 选择器 6 次切换与 `/reload`；这是隔离配置下的真实 TUI 验证，不是当前用户进程或 Windows Terminal 字体、像素和美观性验收。原生较大空白保留，不能保证所有间距严格为 1/2 行。未请求模型或执行回放命令。
 - 中文节点说明由当前主模型生成。插件会加入说明格式要求，但不能保证模型每次都遵守；普通正文和最终答复保持正常排版。
 - 插件默认收起工具详情，并在界面隐藏原生 thinking 正文；原始 thinking 记录和模型上下文保留。插件不会为了过程说明另发模型请求。
 - 摘要用于阅读，可能省略路径和参数。检查准确命令时请展开原生详情，不要把摘要当作完整命令直接执行。
 - 图片服从 Pi 的原生设置。展开详情不会自动开启图片，也不能补回宿主已经截断的输出。
-- 使用公开接口，不替换输入框、底栏或 Pi 自身的消息分隔。其他 Pi 版本可能存在布局差异；间距补齐只在已适配的 `1.3.0` 启用。
+- 使用公开接口，不替换输入框、底栏或 Pi 自身的消息分隔。其他 Pi 版本可能存在布局差异；间距补齐只在已适配的 `1.3.0` / `1.4.0` 启用。
 - Windows Terminal 是当前实际使用环境；其他平台和终端仍需要使用者验证。不兼容的公开接口会回退到原生显示。
 
 ## 更新与卸载
@@ -112,4 +116,4 @@ MIT License · Copyright (c) 2026 myhoodiao
 
 ---
 
-**English:** Compact tool summaries and Chinese progress commentary for Pi Agent CLI. Stay focused on vibe coding, then expand native command details when you need them. Tested with Pi 1.3.0.
+**English:** Compact tool summaries and Chinese progress commentary for Pi Agent CLI. Stay focused on vibe coding, then expand native command details when you need them. Spacing support: Pi 1.3.0 and 1.4.0; other releases retain native spacing.

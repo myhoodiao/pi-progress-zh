@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { mkdtempSync, readFileSync, rmdirSync, unlinkSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { pathToFileURL, fileURLToPath } from "node:url";
 import test from "node:test";
@@ -15,7 +15,8 @@ const INTRA_GAP = Number(source.match(/const INTRA_GAP = (\d);/)[1]);
 const ENABLE_DITTO = source.match(/const ENABLE_DITTO = (true|false);/)[1] === "true";
 assert.ok([1, 2].includes(INTRA_GAP));
 const install = join(homedir(), ".pi", "agent", "install");
-const release = readFileSync(join(install, "current-version"), "utf8").trim();
+const release = process.env.PI_PROGRESS_TEST_RELEASE ?? readFileSync(join(install, "current-version"), "utf8").trim();
+assert.match(release, /^\d+\.\d+\.\d+$/);
 const modules = join(install, "releases", release, "node_modules");
 const agentRoot = join(modules, "@earendil-works", "pi-coding-agent");
 const agent = await import(pathToFileURL(join(agentRoot, "dist", "index.js")));
@@ -843,10 +844,15 @@ test("codemode text results retain two-line nested gaps with image permission en
 test("status identifies the trial version and its limits", async () => {
   const notices = [];
   await extension.commands.get("progress").handler("status", { mode: "tui", ui: { notify: text => notices.push(text) } });
-  assert.match(notices.join("\n"), /0\.10\.0/);
+  assert.match(notices.join("\n"), /0\.10\.1/);
   assert.match(notices.join("\n"), /成功不显示/);
   assert.match(notices.join("\n"), /相对路径/);
   assert.match(notices.join("\n"), /2 行/);
+  assert.ok(notices[0].includes(`当前 Pi ${release}`));
+  assert.match(notices[0], /间距适配 Pi 1\.3\.0 \/ 1\.4\.0/);
+  assert.match(notices.join("\n"), /间距补齐已启用/);
+  const packageVersion = JSON.parse(readFileSync(join(root, "package.json"), "utf8")).version;
+  assert.ok(notices[0].includes(`中文过程展示 ${packageVersion}`));
   assert.ok(notices[0].includes(`G+H+I+J${INTRA_GAP === 1 ? "+K" : ""}${ENABLE_DITTO ? "+L" : ""}`));
   assert.ok(notices.join("\n").includes(`以 ${INTRA_GAP} 行空白`));
   assert.match(notices.join("\n"), /中文与工具目标均不加粗/);
@@ -1779,4 +1785,50 @@ test("inline scripts skip setup boilerplate and extract distinct single-line pat
   assert.match(rendered[1], /skills\/antigravity-quota/);
   assert.match(rendered[2], /skills\/noct-image/);
   assert.match(rendered[3], /extensions\/auto-session-title/);
+});
+
+
+test("unknown host releases retain native gaps and report disabled compensation", async () => {
+  const fixtureRoot = mkdtempSync(join(tmpdir(), "pi-progress-unsupported-"));
+  const fixtureFile = join(fixtureRoot, "index.ts");
+  try {
+    // Exercise the real fallback through the public loader, with only the host VERSION mocked.
+    const fixtureSource = source.replace("import { VERSION,", "import { VERSION as HOST_VERSION,")
+      .replace("export const PLUGIN_VERSION", 'const VERSION = "9.9.9";\nexport const PLUGIN_VERSION');
+    assert.notEqual(fixtureSource, source);
+    writeFileSync(fixtureFile, fixtureSource);
+    const unknown = await loader.loadExtensions([fixtureFile], root);
+    assert.deepEqual(unknown.errors, []);
+    unknown.runtime.getSettings = () => ({ hideThinkingBlock: true });
+    const ext = unknown.extensions[0];
+    const message = assistantCalls(["unknown-a", "unknown-b"]);
+    const before = JSON.stringify(message);
+    await ext.handlers.get("message_update")[0]({ message }, {});
+    const items = message.content.map(call => {
+      const item = new agent.ToolExecutionComponent("read", call.id, call.arguments, { showImages: true },
+        ext.toolRenderers[0]("read", () => native("read")), ui, root);
+      item.updateResult(goodResult(), false);
+      return item;
+    });
+    assert.deepEqual(visibleGaps(items), [1]);
+    const nested = new agent.ToolExecutionComponent("codemode", "unknown-c", { code: "synthetic" },
+      { showImages: true }, ext.toolRenderers[0]("codemode", () => undefined), ui, root);
+    const result = { content: [], details: { calls: [
+      { name: "read", args: "nested-a.md", status: "ok" },
+      { name: "read", args: "nested-b.md", status: "ok" },
+    ] } };
+    const rawResult = JSON.stringify(result);
+    nested.updateResult(result, false);
+    assert.deepEqual(visibleGaps([nested]), [0, 0]);
+    assert.equal(JSON.stringify(result), rawResult);
+    assert.equal(JSON.stringify(message), before);
+    const notices = [];
+    await ext.commands.get("progress").handler("status", { mode: "tui", ui: { notify: text => notices.push(text) } });
+    assert.match(notices[0], /当前 Pi 9\.9\.9/);
+    assert.match(notices.join("\n"), /自动停用补齐/);
+    assert.doesNotMatch(notices.join("\n"), /间距补齐已启用/);
+  } finally {
+    unlinkSync(fixtureFile);
+    rmdirSync(fixtureRoot);
+  }
 });

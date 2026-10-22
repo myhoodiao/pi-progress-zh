@@ -2,8 +2,10 @@ import { posix, win32 } from "node:path";
 import { VERSION, type ExtensionAPI, type MarkdownTransformContext, type Theme, type ToolRenderContext, type ToolRenderers } from "@earendil-works/pi-coding-agent";
 import { Box, Container, Spacer, Text, parseColor, stripTerminalSequences, truncateToWidth, visibleWidth, wrapTextWithAnsi, type Component } from "@earendil-works/pi-tui";
 
-export const PLUGIN_VERSION = "0.10.0";
-export const TESTED_PI_VERSION = "1.3.0";
+export const PLUGIN_VERSION = "0.10.1";
+export const TESTED_PI_VERSIONS = ["1.3.0", "1.4.0"];
+// These releases have identical assistant/tool spacing components. Unknown releases retain native spacing.
+const SPACING_SUPPORTED = TESTED_PI_VERSIONS.includes(VERSION);
 const STAGE_GAP = 2;
 // Independent visual options: G+H+I+J uses INTRA_GAP = 2 and ENABLE_DITTO = false.
 const INTRA_GAP = 2; // K: set to 1 for tighter spacing within a narration node.
@@ -977,7 +979,7 @@ interface GroupRow {
 }
 interface SpacingMessage { message: any; }
 interface ToolGroup { ids: string[]; rows: Map<string, GroupRow>; invalidating: boolean; before: SpacingMessage[]; following: SpacingMessage[]; }
-/** Pi 1.3.0's ordinary assistant prefix, before its first visible text/tool.
+/** Pi 1.3.0/1.4.0's ordinary assistant prefix, before its first visible text/tool.
  * Only add missing rows. Never erase native spacing or touch stored messages.
  * Unknown/interleaved/error layouts retain the native spacing instead of guessing.
  */
@@ -1095,7 +1097,7 @@ class ToolGroups {
   }
   private spacingEnabled(group: ToolGroup): boolean {
     // This compensates a known host layout, not a public universal spacing contract.
-    return VERSION === TESTED_PI_VERSION && [...group.rows.values()].every(row => !row.context.expanded && !(row.context.showImages && row.context.state[imageSlot]));
+    return SPACING_SUPPORTED && [...group.rows.values()].every(row => !row.context.expanded && !(row.context.showImages && row.context.state[imageSlot]));
   }
   private paddingAfter(group: ToolGroup): number {
     if (this.disposed || !this.spacingEnabled(group) || group.following.length === 0) return 0;
@@ -1206,7 +1208,7 @@ export function quietRenderers(toolName: string, original?: ToolRenderers, group
             : ["read", "edit", "write", "ls", "grep", "find"].includes(call.name) ? fileSummary(clean(call.name), clean(call.args))
             : { title: clean(call.name), detail: clean(call.args), path: false };
           const ditto = ENABLE_DITTO && status === "done" && prevStatus === "done" && summary.title === prevTitle;
-          if (VERSION === TESTED_PI_VERSION && !(context.showImages && context.state[imageSlot])) rows.addChild(new Spacer(INTRA_GAP));
+          if (SPACING_SUPPORTED && !(context.showImages && context.state[imageSlot])) rows.addChild(new Spacer(INTRA_GAP));
           rows.addChild(framed(new SummaryLine(summary, status, theme, context.cwd, paths, () => ditto), theme, rowContext, true));
           prevTitle = summary.title; prevStatus = status;
         }
@@ -1295,13 +1297,13 @@ export default function (pi: ExtensionAPI) {
       if (args.trim() && args.trim() !== "status") { ctx.ui.notify("用法：/progress status", "info"); return; }
       const settings = safeGetSettings() ?? {};
       ctx.ui.notify([
-        `中文过程展示 ${PLUGIN_VERSION}；当前 Pi ${VERSION}。间距适配 Pi ${TESTED_PI_VERSION}；当前组合 G+H+I+J${INTRA_GAP === 1 ? "+K" : ""}${ENABLE_DITTO ? "+L" : ""}，保留半屏一至两行摘要、右缘元信息栏、C 目标优先与重复片段省略；实际观感待用户验收。`,
+        `中文过程展示 ${PLUGIN_VERSION}；当前 Pi ${VERSION}。间距适配 Pi ${TESTED_PI_VERSIONS.join(" / ")}；当前组合 G+H+I+J${INTRA_GAP === 1 ? "+K" : ""}${ENABLE_DITTO ? "+L" : ""}，保留半屏一至两行摘要、右缘元信息栏、C 目标优先与重复片段省略；实际观感待用户验收。`,
         supported ? "有文字或 thinking 的响应在原位置显示工具摘要；空白响应仍可集中。收起态先显示目标，再在右缘显示弱化的工具名和状态；简单操作一行，复杂命令第二行显示关键动作和条件；每行连同缩进、工具名和状态不超过可用宽度的一半，未知命令也受限。edit/write 单行显示绿色 +N 新增行与红色 -M 删除行；内联脚本跳过固定初始化并优先提取操作路径或 URL 单行展示。显示具体对象和真实代码片段，保留原有管道或分号，不新增类别标签或箭头链；未知脚本直接保留可读的原始片段。第二行只在包含新增对象、参数或条件时显示；仅重复目标或只剩 && …、; … 时省略，Ctrl+O 仍可查看完整命令。文件目标为 #C9BA9A，错误只在末尾标柔和红色；Ctrl+O 展开原有详情。" : "公开工具渲染接口不可用，工具摘要未启用。",
         "摘要路径：工作目录内使用相对路径，外部绝对路径优先保留末尾三级，重名时增加目录；目录与行号调暗、文件名突出，路径按目录边界折叠，多目标按整项显示并用 +N 标出省略数量。仅在收起显示层清理 shell 转义和边缘引号；Ctrl+O 查看原始详情。成功不显示 [done]，pending/running/error 与内部失败、取消状态仍显示。",
         ENABLE_DITTO ? "同组连续相同且均已完成的工具，从第二条起右栏显示暗色 ·；工具切换、未完成、错误及新节点首条仍显示工具名。" : "右栏逐条保留完整工具名，L 同上省略未启用。",
         markdownSupported ? "节点说明：首行和续行统一 ▎、两列悬挂、最长 68 列正文；中文与工具目标均不加粗，说明首分句提亮、后续较暗、无逗号或分号的单句使用中亮度，英文标识符独立配色；工具行降亮，摘录第二行使用 └ 连接；模型未遵守格式时保留正文显示。" : "公开 Markdown 接口不可用，节点说明保留正文显示。",
         "说明由当前主模型正常输出；插件不另发模型请求，不追加独立说明节点。",
-        VERSION === TESTED_PI_VERSION ? `间距试用：收起态说明到命令及同组命令间以 ${INTRA_GAP} 行空白为目标，跨节点保持 ${STAGE_GAP} 行；只补不足，原生超过目标的保留。展开或工具组实际含可显示图片时保留原生布局。` : "当前 Pi 版本未验证间距模型，自动停用补齐；原生留白保留。",
+        SPACING_SUPPORTED ? `间距补齐已启用：收起态说明到命令及同组命令间以 ${INTRA_GAP} 行空白为目标，跨节点保持 ${STAGE_GAP} 行；只补不足，原生超过目标的保留。展开或工具组实际含可显示图片时保留原生布局。` : "当前 Pi 版本未验证间距模型，自动停用补齐；原生留白保留。",
         "字体由终端决定；不修改 Pi 原生分隔、消息记录或 thinking。",
         `原生 thinking：${markdownSupported ? "插件仅在界面隐藏正文，原始记录保留" : settings.hideThinkingBlock ? "宿主设置隐藏" : "可见"}；工具图片：${settings.terminal?.showImages === false ? "已隐藏" : "允许显示"}。图片继续服从 Pi 原生开关。`,
         ctx.mode === "tui" ? "当前为终端界面。" : "当前不是终端界面，工具协议和原始结果仍正常输出。",
