@@ -1683,3 +1683,100 @@ test("session teardown, stale runtime invalidation and subsequent restore keep r
   freshItem.updateResult(goodResult(), false);
   assert.match(lines(freshItem), /fresh\.md/);
 });
+
+test("edit and write show single-line green +N and red -M line counts within the half-width budget", async () => {
+  await resetGroups();
+  for (const [name, addedColor, removedColor] of [
+    ["dark", "#8FB58D", "#D99083"],
+    ["light", "#4A7A4C", "#A65B52"],
+  ]) {
+    agent.initTheme(name, false);
+    const editArgs = {
+      path: "src/PROJECT.md",
+      oldText: "keep-head\nPRIVATE_OLD_1\nPRIVATE_OLD_2\nkeep-tail",
+      newText: "keep-head\nPRIVATE_NEW_1\nPRIVATE_NEW_2\nPRIVATE_NEW_3\nkeep-tail",
+    };
+    const editBefore = JSON.stringify(editArgs);
+    const editItem = component("edit", editArgs);
+    editItem.updateResult(goodResult(), false);
+    const editRendered = editItem.render(132).find(row => row.includes("PROJECT.md"));
+    assert.equal(summaryRows(editItem, 132).length, 1);
+    assert.match(summaryRows(editItem, 132)[0], /src\/PROJECT\.md  \+3 -2\s+edit$/);
+    assert.ok(editRendered.includes(theme.style("+3", { fg: tui.parseColor(addedColor), bold: false })));
+    assert.ok(editRendered.includes(theme.style("-2", { fg: tui.parseColor(removedColor), bold: false })));
+    assert.doesNotMatch(lines(editItem, 132), /PRIVATE_/);
+    assert.equal(JSON.stringify(editArgs), editBefore);
+
+    const writeArgs = { path: "docs/LOCAL-UPDATE.md", content: "line-1\nline-2\nPRIVATE_WRITE_LINE_3\n" };
+    const writeBefore = JSON.stringify(writeArgs);
+    const writeItem = component("write", writeArgs);
+    writeItem.updateResult(goodResult(), false);
+    const writeRendered = writeItem.render(132).find(row => row.includes("LOCAL-UPDATE.md"));
+    assert.equal(summaryRows(writeItem, 132).length, 1);
+    assert.match(summaryRows(writeItem, 132)[0], /docs\/LOCAL-UPDATE\.md  \+3\s+write$/);
+    assert.ok(writeRendered.includes(theme.style("+3", { fg: tui.parseColor(addedColor), bold: false })));
+    assert.doesNotMatch(summaryRows(writeItem, 132)[0], /-\d/);
+    assert.doesNotMatch(lines(writeItem, 132), /PRIVATE_/);
+    assert.equal(JSON.stringify(writeArgs), writeBefore);
+
+    for (const width of [16, 24, 32, 80, 132, 200]) {
+      assertHalf(editItem, width);
+      assertHalf(writeItem, width);
+      assert.equal(summaryRows(editItem, width).length, 1);
+      assert.equal(summaryRows(writeItem, width).length, 1);
+    }
+  }
+  agent.initTheme("dark", false);
+
+  const multiEdit = component("edit", {
+    path: "CHANGELOG.md",
+    edits: [
+      { oldText: "same\n", newText: "same\nadded-a\nadded-b\n" },
+      { oldText: "remove-only\n", newText: "" },
+    ],
+  });
+  multiEdit.updateResult(goodResult(), false);
+  assert.match(summaryRows(multiEdit, 132)[0], /CHANGELOG\.md  \+2 -1\s+edit$/);
+});
+
+test("inline scripts skip setup boilerplate and extract distinct single-line path or URL targets", async () => {
+  await resetGroups();
+  const rawAssignScript = [
+    'python -c "',
+    "import os, json",
+    "pi_dir = r'C:\\Users\\demo\\.pi\\agent'",
+    "for sub in ['extensions', 'skills', 'settings.json']:",
+    "    p = os.path.join(pi_dir, sub)",
+    "    print(p, os.path.exists(p))",
+    '"',
+  ].join("\n");
+  const assignItem = component("bash", { command: rawAssignScript }, undefined, { cwd: "C:\\Windows\\System32" });
+  assignItem.updateResult(goodResult(), false);
+  const assignRows = summaryRows(assignItem, 160);
+  assert.equal(assignRows.length, 1);
+  assert.match(assignRows[0], /\.pi\/agent\/extensions, .*\.pi\/agent\/skills/);
+  assert.doesNotMatch(assignRows[0], /pi_dir\s*=\s*r/);
+  assertHalf(assignItem, 80);
+  assertHalf(assignItem, 160);
+
+  const reconfigureCommands = [
+    "python -c \"\nimport sys, urllib.request, json\nsys.stdout.reconfigure(encoding='utf-8')\nurl = 'https://api.github.com/repos/QingYunA/answer-me-with-html/releases/tags/v0.5.6'\n\"",
+    "python -c \"\nimport sys, os\nsys.stdout.reconfigure(encoding='utf-8')\nbase = r'C:\\Users\\demo\\.pi\\agent\\skills\\antigravity-quota'\nfor root, dirs, files in os.walk(base):\n    pass\n\"",
+    "python -c \"\nimport sys, os\nsys.stdout.reconfigure(encoding='utf-8')\nbase = r'C:\\Users\\demo\\.pi\\agent\\skills\\noct-image'\nfor root, dirs, files in os.walk(base):\n    pass\n\"",
+    "python -c \"\nimport sys, os\nsys.stdout.reconfigure(encoding='utf-8')\nbase = r'C:\\Users\\demo\\.pi\\agent\\extensions\\auto-session-title'\nfor f in os.listdir(base):\n    pass\n\"",
+  ];
+  const rendered = reconfigureCommands.map(command => {
+    const item = component("bash", { command }, undefined, { cwd: "C:\\Windows\\System32" });
+    item.updateResult(goodResult(), false);
+    const rows = summaryRows(item, 160);
+    assert.equal(rows.length, 1, command);
+    assert.doesNotMatch(rows[0], /sys\.stdout\.reconfigure/);
+    assertHalf(item, 80);
+    return rows[0];
+  });
+  assert.equal(new Set(rendered).size, 4);
+  assert.match(rendered[0], /answer-me-with-html\/releases\/tags\/v0\.5\.6/);
+  assert.match(rendered[1], /skills\/antigravity-quota/);
+  assert.match(rendered[2], /skills\/noct-image/);
+  assert.match(rendered[3], /extensions\/auto-session-title/);
+});

@@ -19,6 +19,8 @@ const RANGE_DARK = parseColor("#6E797C");
 const RANGE_LIGHT = parseColor("#687377");
 const SEP_DARK = parseColor("#5F696C");
 const SEP_LIGHT = parseColor("#788286");
+const ADDED_DARK = parseColor("#8FB58D");
+const ADDED_LIGHT = parseColor("#4A7A4C");
 const SOFT_ERROR_DARK = parseColor("#D99083");
 const SOFT_ERROR_LIGHT = parseColor("#A65B52");
 const RAIL_DARK = parseColor("#4F5550");
@@ -31,8 +33,75 @@ export const NARRATION_RULES = [
 
 const nativeSlot = Symbol("progress-native-renderer");
 const imageSlot = Symbol("progress-result-has-images");
+const diffSlot = Symbol("progress-result-diff-counts");
 const priorityKeys = ["file_path", "path", "paths", "url", "uri", "resource", "resource_uri", "query", "pattern", "command", "cmd", "code"];
 const bodyKeys = /^(content|text|oldText|newText|old_string|new_string|data|base64|body|code|script)$/i;
+interface DiffCounts { added: number; removed: number; }
+function countTextLines(value: unknown): number {
+  if (typeof value !== "string" || !value) return 0;
+  const trimmed = value.replace(/\r?\n$/, "");
+  return trimmed ? trimmed.split(/\r?\n/).length : 0;
+}
+function diffLineCounts(oldValue: unknown, newValue: unknown): DiffCounts {
+  const oldStr = typeof oldValue === "string" ? oldValue : "";
+  const newStr = typeof newValue === "string" ? newValue : "";
+  if (!oldStr && !newStr) return { added: 0, removed: 0 };
+  const oldLines = oldStr ? oldStr.replace(/\r?\n$/, "").split(/\r?\n/) : [];
+  const newLines = newStr ? newStr.replace(/\r?\n$/, "").split(/\r?\n/) : [];
+  let start = 0;
+  while (start < oldLines.length && start < newLines.length && oldLines[start] === newLines[start]) start++;
+  let oldEnd = oldLines.length, newEnd = newLines.length;
+  while (oldEnd > start && newEnd > start && oldLines[oldEnd - 1] === newLines[newEnd - 1]) { oldEnd--; newEnd--; }
+  const a = oldLines.slice(start, oldEnd), b = newLines.slice(start, newEnd);
+  if (!a.length || !b.length || a.length * b.length > 160000) return { added: b.length, removed: a.length };
+  const stride = b.length + 1;
+  const dp = new Uint16Array(stride * 2);
+  for (let i = 0; i < a.length; i++) {
+    const prev = (i & 1) * stride, curr = ((i + 1) & 1) * stride;
+    for (let j = 0; j < b.length; j++) {
+      dp[curr + j + 1] = a[i] === b[j] ? dp[prev + j] + 1 : Math.max(dp[prev + j + 1], dp[curr + j]);
+    }
+  }
+  const lcs = dp[(a.length & 1) * stride + b.length];
+  return { added: b.length - lcs, removed: a.length - lcs };
+}
+function extractDiffCounts(toolName: string, args: any, stored?: DiffCounts): DiffCounts | undefined {
+  if (stored && (stored.added > 0 || stored.removed > 0)) return stored;
+  if (toolName === "write") {
+    const added = countTextLines(args?.content ?? args?.text);
+    return added > 0 ? { added, removed: 0 } : undefined;
+  }
+  if (toolName === "edit") {
+    const edits = Array.isArray(args?.edits) ? args.edits
+      : (args?.oldText !== undefined || args?.newText !== undefined || args?.old_string !== undefined || args?.new_string !== undefined) ? [args] : [];
+    let added = 0, removed = 0;
+    for (const entry of edits) {
+      if (!entry || typeof entry !== "object") continue;
+      const counts = diffLineCounts(entry.oldText ?? entry.old_string, entry.newText ?? entry.new_string);
+      added += counts.added;
+      removed += counts.removed;
+    }
+    return added > 0 || removed > 0 ? { added, removed } : undefined;
+  }
+}
+function patchDiffCounts(details: any): DiffCounts | undefined {
+  if (typeof details?.patch === "string" && details.patch.trim()) {
+    let added = 0, removed = 0;
+    for (const line of details.patch.split(/\r?\n/)) {
+      if (line.startsWith("+") && !line.startsWith("+++")) added++;
+      else if (line.startsWith("-") && !line.startsWith("---")) removed++;
+    }
+    if (added > 0 || removed > 0) return { added, removed };
+  }
+  if (typeof details?.diff === "string" && details.diff.trim()) {
+    let added = 0, removed = 0;
+    for (const line of details.diff.split(/\r?\n/)) {
+      if (/^\s*\+(?!\+)/.test(line)) added++;
+      else if (/^\s*-(?!-)/.test(line)) removed++;
+    }
+    if (added > 0 || removed > 0) return { added, removed };
+  }
+}
 function formatArguments(args: unknown): string {
   try { return JSON.stringify(args, null, 2) ?? String(args); } catch { return "参数无法格式化。"; }
 }
@@ -85,13 +154,15 @@ function middlePath(text: string, width: number): string {
   const body = range ? text.slice(0, -range.length) : text;
   const sep = body.match(/[\\/]/)?.[0];
   if (sep) {
-    const segs = body.split(/[\\/]/);
+    const urlOrigin = body.match(/^[a-z][a-z\d+.-]*:\/\/[^\\/]+/i)?.[0];
+    const segs = urlOrigin ? [urlOrigin, ...body.slice(urlOrigin.length).split(/[\\/]/).filter(Boolean)] : body.split(/[\\/]/);
     const last = segs.at(-1)! + range;
-    let candidate = `${segs[0]}${sep}…${sep}${last}`;
+    const prefix = segs[0] === "…" ? "…" : `${segs[0]}${sep}…`;
+    let candidate = `${prefix}${sep}${last}`;
     if (visibleWidth(candidate) <= width) {
       const tail = [last];
       for (let index = segs.length - 2; index > 0; index--) {
-        const next = `${segs[0]}${sep}…${sep}${segs[index]}${sep}${tail.join(sep)}`;
+        const next = `${prefix}${sep}${segs[index]}${sep}${tail.join(sep)}`;
         if (visibleWidth(next) > width) break;
         tail.unshift(segs[index]); candidate = next;
       }
@@ -135,11 +206,12 @@ class PathLabels {
   }
 }
 interface SummarySegment { text: string; file?: boolean; path?: boolean; reference?: boolean; suffix?: string; }
-interface Summary { title: string; detail: string; path: boolean; fileTitle?: boolean; segments?: SummarySegment[]; subline?: string; preview?: PreviewPart[]; continuation?: string; }
-function fileSummary(title: string, fileTarget: string, prefix = "", suffix = ""): Summary {
+interface Summary { title: string; detail: string; path: boolean; fileTitle?: boolean; segments?: SummarySegment[]; subline?: string; preview?: PreviewPart[]; continuation?: string; diff?: DiffCounts; }
+function fileSummary(title: string, fileTarget: string, prefix = "", suffix = "", diff?: DiffCounts): Summary {
   return {
     title, detail: fileTarget + suffix, path: true, fileTitle: true,
     segments: [{ text: fileTarget, file: true, path: true, suffix }], subline: prefix ? prefix.trim() : undefined,
+    diff: diff && (diff.added > 0 || diff.removed > 0) ? diff : undefined,
   };
 }
 /** Accept literal operands only. This is display parsing, never shell execution. */
@@ -461,9 +533,182 @@ function knownProgram(title: string, source: string): Summary | undefined {
     return { title, detail: "", path: false, segments: pathSegments([unquoteWord(url)], false), preview: parts };
   }
 }
+function stripEnvPrefix(source: string): string {
+  const words = commandWords(source);
+  let index = 0;
+  while (index < words.length - 1 && /^[A-Za-z_]\w*=(?:'[^']*'|"[^"]*"|[^\s;|&#()]+)$/.test(words[index])) index++;
+  if (!index) return source;
+  let cursor = 0;
+  for (let i = 0; i < index; i++) cursor = source.indexOf(words[i], cursor) + words[i].length;
+  return source.slice(cursor).trim();
+}
+function stripScriptComment(line: string): string {
+  let quote = "";
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (ch === "\\" && quote) { i++; continue; }
+    if (quote) { if (ch === quote) quote = ""; continue; }
+    if (ch === "'" || ch === '"') { quote = ch; continue; }
+    if (ch === "#") return line.slice(0, i);
+  }
+  return line;
+}
+function splitScriptStatements(source: string): string[] {
+  const result: string[] = [];
+  for (const rawLine of source.split(/\r?\n/)) {
+    const line = stripScriptComment(rawLine).trim();
+    if (!line) continue;
+    let start = 0, quote = "", depth = 0;
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (ch === "\\" && quote) { i++; continue; }
+      if (quote) { if (ch === quote) quote = ""; continue; }
+      if (ch === "'" || ch === '"') { quote = ch; continue; }
+      if ("([{".includes(ch)) depth++;
+      else if (")]}".includes(ch)) depth = Math.max(0, depth - 1);
+      else if (!depth && ch === ";") {
+        const part = line.slice(start, i).trim();
+        if (part) result.push(part);
+        start = i + 1;
+      }
+    }
+    const tail = line.slice(start).trim();
+    if (tail) result.push(tail);
+  }
+  return result;
+}
+function classifyScriptLiteral(raw: string, inPathContext = false): { text: string; file: boolean; path: boolean } | undefined {
+  const value = raw.trim().replace(/\\\\/g, "\\");
+  if (!value || /[\x00-\x1f<>|{}]/.test(value) || /(?:---|===)/.test(value)) return;
+  if (/^https?:\/\/[^\s'"<>|{}]+$/i.test(value)) return { text: value, file: false, path: true };
+  if (/[*?]/.test(value)) return;
+  if (/^(?:[A-Za-z]:[\\/]|\\\\[A-Za-z0-9_.-]+[\\/])[^\x00-\x1f"*?<>|{}]+$/.test(value)) return { text: value, file: true, path: true };
+  if (/^~[\\/][^\x00-\x1f"*?<>|{}\s]+$/.test(value)) return { text: value, file: true, path: true };
+  if (/^(?:\.\.?[\\/]|[A-Za-z0-9_.-]+(?:[\\/][A-Za-z0-9_.-]+)+)$/.test(value)
+    && !/^(?:Mozilla|application|text|image|audio|video|multipart)\//i.test(value)
+    && (inPathContext || /\.(?:md|json|jsonl|js|mjs|cjs|ts|tsx|py|yaml|yml|toml|txt|html|css|sh|ps1|cmd|bat)$/i.test(value))) {
+    return { text: value, file: true, path: true };
+  }
+}
+/** Extract concrete file/directory/URL targets from inline scripts without executing code. */
+function extractScriptTargets(body: string): SummarySegment[] {
+  const cleanLines = body.split(/\r?\n/).map(stripScriptComment);
+  const cleanBody = cleanLines.join("\n");
+  const statements = splitScriptStatements(body);
+  const pathVars = new Map<string, string>();
+  const listVars = new Map<string, string[]>();
+  for (const match of cleanBody.matchAll(/\b(?:for\s+([A-Za-z_]\w*)\s+in\s+|([A-Za-z_]\w*)\s*=\s*)\[([^\]]+)\]/g)) {
+    const name = match[1] ?? match[2];
+    const items = [...match[3].matchAll(/[rR]?(['"])([^'"\r\n]+)\1/g)].map(m => m[2].trim()).filter(Boolean);
+    if (name && items.length) listVars.set(name, items);
+  }
+  for (const stmt of statements) {
+    const assign = stmt.match(/^(?:(?:const|let|var)\s+)?([A-Za-z_]\w*)\s*=\s*(?:Path\(\s*)?[rR]?(['"])([^'"\r\n]+)\2\s*\)?$/);
+    if (assign) {
+      const classified = classifyScriptLiteral(assign[3], true);
+      if (classified?.file) pathVars.set(assign[1], classified.text.replace(/[\\/]+$/, ""));
+    }
+  }
+  const directVars = new Set<string>();
+  for (const match of cleanBody.matchAll(/\b(?:listdir|walk|scandir|open|exists|isdir|isfile|read_text|write_text|glob|rglob)\s*\(\s*([A-Za-z_]\w*)\s*[,)]/g)) {
+    if (pathVars.has(match[1])) directVars.add(match[1]);
+  }
+  const concreteJoinedVars = new Set<string>();
+  for (const match of cleanBody.matchAll(/\b(?:os\.path\.join|posix\.join|win32\.join|path\.join|join)\s*\(\s*([A-Za-z_]\w*)\s*,\s*(?:[rR]?(['"])([^'"\r\n]+)\2|([A-Za-z_]\w*))\s*\)/g)) {
+    if (pathVars.has(match[1]) && (match[3] || (match[4] && listVars.has(match[4])))) concreteJoinedVars.add(match[1]);
+  }
+  for (const match of cleanBody.matchAll(/\b([A-Za-z_]\w*)\s*\/\s*[rR]?(['"])([^'"\r\n]+)\2/g)) {
+    if (pathVars.has(match[1])) concreteJoinedVars.add(match[1]);
+  }
+  const seen = new Set<string>();
+  const collected: { text: string; file: boolean; path: boolean }[] = [];
+  const push = (item?: { text: string; file: boolean; path: boolean }) => {
+    if (!item) return;
+    const key = item.text.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    collected.push(item);
+  };
+  const consumedLists = new Set<string>();
+  for (const stmt of statements) {
+    if (/^(?:import\s|from\s+\S+\s+import\b|sys\.std(?:out|err)\.reconfigure\s*\()/i.test(stmt)) continue;
+    const assign = stmt.match(/^(?:(?:const|let|var)\s+)?([A-Za-z_]\w*)\s*=\s*(?:Path\(\s*)?[rR]?(['"])([^'"\r\n]+)\2\s*\)?$/);
+    if (assign && pathVars.has(assign[1])) {
+      if (directVars.has(assign[1]) || !concreteJoinedVars.has(assign[1])) push({ text: pathVars.get(assign[1])!, file: true, path: true });
+      continue;
+    }
+    const isPrint = /^(?:print|console\.(?:log|info|warn|error))\s*\(/.test(stmt);
+    const scopes = isPrint
+      ? [...stmt.matchAll(/\b(?:open|listdir|walk|scandir|Path|join|copy\w*|rmtree|get_\w+|urlopen|Request)\s*\(([^)]*)\)/g)].map(m => m[0])
+      : [stmt];
+    for (let scope of scopes) {
+      scope = scope.replace(/\b(?:os\.path\.join|posix\.join|win32\.join|path\.join|join)\s*\(\s*([^,()]+?)\s*,\s*([^,()]+?)\s*\)/g, (full, rawBase, rawChild) => {
+        const baseVar = rawBase.trim();
+        const baseLit = rawBase.trim().match(/^[rR]?(['"])([^'"\r\n]+)\1$/)?.[2];
+        const baseClassified = baseLit ? classifyScriptLiteral(baseLit, true) : undefined;
+        const basePath = pathVars.get(baseVar) ?? (baseClassified?.file ? baseClassified.text.replace(/[\\/]+$/, "") : undefined);
+        if (!basePath) return full;
+        const childLit = rawChild.trim().match(/^[rR]?(['"])([^'"\r\n]+)\1$/)?.[2];
+        const childVar = rawChild.trim();
+        if (childLit) { push({ text: `${basePath}/${childLit.replace(/^[\\/]+/, "")}`, file: true, path: true }); return ""; }
+        if (listVars.has(childVar)) {
+          consumedLists.add(childVar);
+          for (const item of listVars.get(childVar)!) push({ text: `${basePath}/${item.replace(/^[\\/]+/, "")}`, file: true, path: true });
+          return "";
+        }
+        return full;
+      });
+      scope = scope.replace(/\b([A-Za-z_]\w*)\s*\/\s*[rR]?(['"])([^'"\r\n]+)\2/g, (full, baseVar, _q, childLit) => {
+        const basePath = pathVars.get(baseVar);
+        if (!basePath) return full;
+        push({ text: `${basePath}/${childLit.replace(/^[\\/]+/, "")}`, file: true, path: true });
+        return "";
+      });
+      const inPathCall = /\b(?:Path|open|listdir|walk|scandir|exists|isdir|isfile|copy\w*|rmtree|read_text|write_text|glob|rglob)\s*\(/.test(scope);
+      for (const lit of scope.matchAll(/([fFrR]{0,2})(['"])([^'"\r\n]+)\2/g)) {
+        const prefix = lit[1].toLowerCase(), rawVal = lit[3];
+        if (prefix.includes("f") && /^https?:\/\/[^\s'"<>]+\{[A-Za-z_]\w*\}/i.test(rawVal)) {
+          for (const [, items] of listVars) if (items.every(item => /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(item))) {
+            for (const item of items) push({ text: item, file: false, path: false });
+          }
+          for (const call of cleanBody.matchAll(/\bget_[A-Za-z_]\w*\(\s*(['"])([^'"\r\n]+)\1\s*\)/g)) {
+            push({ text: rawVal.replace(/\{[A-Za-z_]\w*\}/, call[2]), file: false, path: true });
+          }
+          continue;
+        }
+        push(classifyScriptLiteral(rawVal, inPathCall));
+      }
+    }
+  }
+  for (const [name, items] of listVars) {
+    if (consumedLists.has(name)) continue;
+    for (const item of items) push(classifyScriptLiteral(item, true));
+  }
+  return collected.flatMap((item, index) => [...(index ? [{ text: ", " }] : []), { text: clean(item.text), file: item.file, path: item.path }]);
+}
+function scriptSummary(title: string, program: string, flag: string, body: string): Summary {
+  const globs = [...body.matchAll(/^[ \t]*(?:for\s+[A-Za-z_]\w*\s+in\s+|[A-Za-z_]\w*\s*=\s*)?Path\(\s*(['"])([^'"\n]+)\1\s*\)\.glob\(\s*(['"])([^'"\n]+)\3\s*\)/gm)];
+  if (globs.length === 1) {
+    const glob = globs[0];
+    const line = body.slice(glob.index!).split(/\r?\n/)[0];
+    return { title, detail: "", path: false, segments: pathSegments([`${glob[2].replace(/[\\/]$/, "")}/${glob[4]}`], false), subline: `${program} ${flag} '… ${clean(line)} …'` };
+  }
+  const targets = extractScriptTargets(body);
+  if (targets.length) {
+    return { title, detail: "", path: false, fileTitle: targets.some(segment => segment.file), segments: targets };
+  }
+  return codeFallback(title, body, true);
+}
 function commandSummary(title: string, value: unknown, depth = 0): Summary {
-  const source = typeof value === "string" ? stripTerminalSequences(value).trim() : "";
-  if (!source) return primarySummary(title, "…");
+  const rawSource = typeof value === "string" ? stripTerminalSequences(value).trim() : "";
+  if (!rawSource) return primarySummary(title, "…");
+  const source = stripEnvPrefix(rawSource);
+  const heredoc = source.match(/^(python(?:3(?:\.\d+)?)?|py|node|nodejs|bash|sh|pwsh|powershell)\b[^\n]*<<-?\s*(['"]?)([A-Za-z_]\w*)\2[ \t]*\r?\n([\s\S]*?)(?:\r?\n\3[ \t]*$|$)/i);
+  if (heredoc && depth < 3) {
+    const [, runner, , , body] = heredoc;
+    if (/^(?:bash|sh|pwsh|powershell)$/i.test(runner)) return commandSummary(title, body, depth + 1);
+    return scriptSummary(title, programName(runner), "-c", body);
+  }
   const words = commandWords(source);
   const program = programName(words[0] ?? "");
   const ps = parsedPowerShell(title, source);
@@ -487,13 +732,7 @@ function commandSummary(title: string, value: unknown, depth = 0): Summary {
     let body = source.slice(cursor).trim();
     if ((body.startsWith("'") && body.endsWith("'")) || (body.startsWith('"') && body.endsWith('"'))) body = body.slice(1, -1);
     if (shell) return commandSummary(title, body, depth + 1);
-    const globs = [...body.matchAll(/^[ \t]*(?:for\s+[A-Za-z_]\w*\s+in\s+|[A-Za-z_]\w*\s*=\s*)?Path\(\s*(['"])([^'"\n]+)\1\s*\)\.glob\(\s*(['"])([^'"\n]+)\3\s*\)/gm)];
-    if (globs.length === 1) {
-      const glob = globs[0];
-      const line = body.slice(glob.index!).split(/\r?\n/)[0];
-      return { title, detail: "", path: false, segments: pathSegments([`${glob[2].replace(/[\\/]$/, "")}/${glob[4]}`], false), subline: `${program} ${words[flag]} '… ${clean(line)} …'` };
-    }
-    return codeFallback(title, body, true);
+    return scriptSummary(title, program, words[flag], body);
   }
   const known = knownProgram(title, source);
   if (known) return { ...known, preview: undefined, subline: known.preview ? excerptPayload(source) : undefined };
@@ -508,11 +747,19 @@ function commandSummary(title: string, value: unknown, depth = 0): Summary {
 }
 
 function codeFallback(title: string, source: string, opaque = false): Summary {
-  const lines = source.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
-  const substantive = lines.filter(line => !/^(?:#|import\s|from\s|\$ErrorActionPreference\s*=)/i.test(line)
+  const rawLines = source.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+  const lines = opaque && rawLines.length === 1 && rawLines[0].includes(";") ? splitScriptStatements(source) : rawLines;
+  const substantive = lines.filter(line => !/^(?:#|import\s|from\s|\$ErrorActionPreference\s*=|sys\.std(?:out|err)\.reconfigure\s*\(|os\.environ(?:\[|\.get\b).*=\s*)/i.test(line)
+    && !/^print\s*\(\s*[rR]?(['"])[-=_*\s]{3,}.*\1\s*\)$/i.test(line)
     && !(opaque && lines.length > 1 && /^[A-Za-z_]\w*$/.test(line)));
-  const first = substantive[0] ?? lines[0] ?? "…";
-  const cleanFirst = excerptPayload(first, opaque);
+  let first = substantive[0] ?? lines[0] ?? "…";
+  if (opaque && substantive.length > 1 && /[[({:]$/.test(first)) {
+    first = `${first} ${substantive[1]}`;
+  }
+  let cleanFirst = excerptPayload(first, opaque);
+  if (opaque && substantive.length > 1 && visibleWidth(cleanFirst) < 24 && !/(\[[A-Za-z_.]+\]::[A-Za-z_$][\w$]*|[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+(?=\s*\())/.test(first)) {
+    cleanFirst = `${cleanFirst}; ${excerptPayload(substantive[1], opaque)}`;
+  }
   if (!substantive.length) return primarySummary(title, cleanFirst);
   const api = first.match(/(\[[A-Za-z_.]+\]::[A-Za-z_$][\w$]*|[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+(?=\s*\())/)?.[1];
   if (api) return { title, detail: api, path: false, subline: cleanFirst };
@@ -547,7 +794,7 @@ function tidyExcerpt(text: string): string {
 class SummaryLine implements Component {
   private segments: (Omit<SummarySegment, "text"> & { text: () => string })[];
   constructor(private summary: Summary, private status: string, private theme: Theme, cwd = "", paths?: PathLabels,
-    private sameTool: () => boolean = () => false) {
+    private sameTool: () => boolean = () => false, private diffCounts: () => DiffCounts | undefined = () => this.summary.diff) {
     this.segments = (summary.segments ?? [{ text: summary.detail, path: summary.path }]).map(segment => {
       const text = cleanDisplayToken(segment.text);
       const label = segment.path && paths ? paths.label(text, cwd) : () => text;
@@ -580,7 +827,24 @@ class SummaryLine implements Component {
     const meta = `${type}${suffixStyled}`;
     const metaWidth = visibleWidth(meta);
     const targetText = segments.map(segment => segment.text).join("");
-    const available = Math.max(0, width - metaWidth);
+    const rawAvailable = Math.max(0, width - metaWidth);
+    const diff = this.diffCounts();
+    const diffPlainParts: string[] = [];
+    const diffStyledParts: string[] = [];
+    if (diff) {
+      if (diff.added > 0) {
+        diffPlainParts.push(`+${diff.added}`);
+        diffStyledParts.push(this.theme.style(`+${diff.added}`, { fg: light ? ADDED_LIGHT : ADDED_DARK, bold: false }));
+      }
+      if (diff.removed > 0) {
+        diffPlainParts.push(`-${diff.removed}`);
+        diffStyledParts.push(this.theme.style(`-${diff.removed}`, { fg: light ? SOFT_ERROR_LIGHT : SOFT_ERROR_DARK, bold: false }));
+      }
+    }
+    const diffPlain = diffPlainParts.length ? `  ${diffPlainParts.join(" ")}` : "";
+    const showDiff = Boolean(diffPlain) && rawAvailable >= targetFloor + visibleWidth(diffPlain);
+    const diffStyled = showDiff ? `  ${diffStyledParts.join(" ")}` : "";
+    const available = Math.max(0, rawAvailable - (showDiff ? visibleWidth(diffPlain) : 0));
     // H lays out complete logical items in plain text before G applies ANSI colors.
     const items: SummarySegment[][] = [[]];
     for (const segment of segments) {
@@ -625,7 +889,8 @@ class SummaryLine implements Component {
         + style(body.slice(split), baseColor) + style(range, light ? RANGE_LIGHT : RANGE_DARK);
     };
     const target = chosen.map(item => item.map(styleSegment).join("")).join(this.theme.style(", ", { fg: sepColor }))
-      + (chosen.length < items.length ? this.theme.style(`  +${items.length - chosen.length}`, { fg: sepColor }) : "");
+      + (chosen.length < items.length ? this.theme.style(`  +${items.length - chosen.length}`, { fg: sepColor }) : "")
+      + diffStyled;
     // A puts the type and state on one right edge while short targets keep a gap.
     const align = visibleWidth(target) > 0 && metaWidth > 0;
     const padding = align ? " ".repeat(Math.max(0, width - metaWidth - visibleWidth(target))) : "";
@@ -668,7 +933,7 @@ function originalComponent(original: ToolRenderers | undefined, slot: "call" | "
     return component;
   } catch { cache[slot] = undefined; return undefined; }
 }
-function summarize(toolName: string, args: any, original: Component | undefined, cwd: string): Summary {
+function summarize(toolName: string, args: any, original: Component | undefined, cwd: string, storedDiff?: DiffCounts): Summary {
   let nativeTitle = "";
   // Use only its first heading; no native result/body enters the collapsed row.
   try { nativeTitle = clean(original?.render(256).find(line => clean(line)) ?? ""); } catch { /* Generic heading below. */ }
@@ -678,7 +943,8 @@ function summarize(toolName: string, args: any, original: Component | undefined,
     const start = Number.isInteger(args?.offset) && args.offset > 0 ? args.offset : 1;
     const range = toolName === "read" && (args?.offset != null || args?.limit != null)
       ? `:${start}${Number.isInteger(args.limit) && args.limit > 0 ? `-${start + args.limit - 1}` : ""}` : "";
-    return fileSummary(title, rawPath || "…", "", range);
+    const diff = (toolName === "edit" || toolName === "write") ? extractDiffCounts(toolName, args, storedDiff) : undefined;
+    return fileSummary(title, rawPath || "…", "", range, diff);
   }
   if (["bash", "powershell"].includes(toolName)) {
     return commandSummary(toolName, args?.command);
@@ -914,13 +1180,18 @@ export function quietRenderers(toolName: string, original?: ToolRenderers, group
         if (!native) return wrap(context, "call", fallback);
         return wrap(context, "call", new SafeNative(original?.renderShell === "self" ? native : framed(native, theme, context), fallback));
       }
-      const summary = summarize(toolName, args, native, context.cwd);
+      const summary = summarize(toolName, args, native, context.cwd, context.state[diffSlot]);
       const status = stateOf(context);
       return wrap(context, "call", framed(new SummaryLine(summary, status, theme, context.cwd, paths,
-        () => groups?.isSameToolAsPrevious(context.toolCallId, summary.title, status) ?? false), theme, context, true), summary.title);
+        () => groups?.isSameToolAsPrevious(context.toolCallId, summary.title, status) ?? false,
+        () => context.state[diffSlot] ?? summary.diff), theme, context, true), summary.title);
     },
     renderResult(result, options, theme, context) {
       context.state[imageSlot] = result.content.some(part => part.type === "image");
+      if (toolName === "edit") {
+        const counts = patchDiffCounts(result?.details);
+        if (counts) context.state[diffSlot] = counts;
+      }
       if (!options.expanded) {
         if (toolName !== "codemode" || !Array.isArray(result.details?.calls)) return wrap(context, "result", new Container());
         const rows = new Container();
@@ -931,7 +1202,7 @@ export function quietRenderers(toolName: string, original?: ToolRenderers, group
           const rowContext = { ...context, isPartial: call.status === "running", isError: call.status === "error" || call.status === "cancelled" };
           let args: any;
           try { args = typeof call.args === "string" ? JSON.parse(call.args) : call.args; } catch { /* Keep non-JSON native summaries below. */ }
-          const summary = args && typeof args === "object" ? summarize(call.name, args, undefined, context.cwd)
+          const summary = args && typeof args === "object" ? summarize(call.name, args, undefined, context.cwd, patchDiffCounts(call.details))
             : ["read", "edit", "write", "ls", "grep", "find"].includes(call.name) ? fileSummary(clean(call.name), clean(call.args))
             : { title: clean(call.name), detail: clean(call.args), path: false };
           const ditto = ENABLE_DITTO && status === "done" && prevStatus === "done" && summary.title === prevTitle;
@@ -1025,7 +1296,7 @@ export default function (pi: ExtensionAPI) {
       const settings = safeGetSettings() ?? {};
       ctx.ui.notify([
         `中文过程展示 ${PLUGIN_VERSION}；当前 Pi ${VERSION}。间距适配 Pi ${TESTED_PI_VERSION}；当前组合 G+H+I+J${INTRA_GAP === 1 ? "+K" : ""}${ENABLE_DITTO ? "+L" : ""}，保留半屏一至两行摘要、右缘元信息栏、C 目标优先与重复片段省略；实际观感待用户验收。`,
-        supported ? "有文字或 thinking 的响应在原位置显示工具摘要；空白响应仍可集中。收起态先显示目标，再在右缘显示弱化的工具名和状态；简单操作一行，复杂命令第二行显示关键动作和条件；每行连同缩进、工具名和状态不超过可用宽度的一半，未知命令也受限。显示具体对象和真实代码片段，保留原有管道或分号，不新增类别标签或箭头链；未知脚本直接保留可读的原始片段。第二行只在包含新增对象、参数或条件时显示；仅重复目标或只剩 && …、; … 时省略，Ctrl+O 仍可查看完整命令。文件目标为 #C9BA9A，错误只在末尾标柔和红色；Ctrl+O 展开原有详情。" : "公开工具渲染接口不可用，工具摘要未启用。",
+        supported ? "有文字或 thinking 的响应在原位置显示工具摘要；空白响应仍可集中。收起态先显示目标，再在右缘显示弱化的工具名和状态；简单操作一行，复杂命令第二行显示关键动作和条件；每行连同缩进、工具名和状态不超过可用宽度的一半，未知命令也受限。edit/write 单行显示绿色 +N 新增行与红色 -M 删除行；内联脚本跳过固定初始化并优先提取操作路径或 URL 单行展示。显示具体对象和真实代码片段，保留原有管道或分号，不新增类别标签或箭头链；未知脚本直接保留可读的原始片段。第二行只在包含新增对象、参数或条件时显示；仅重复目标或只剩 && …、; … 时省略，Ctrl+O 仍可查看完整命令。文件目标为 #C9BA9A，错误只在末尾标柔和红色；Ctrl+O 展开原有详情。" : "公开工具渲染接口不可用，工具摘要未启用。",
         "摘要路径：工作目录内使用相对路径，外部绝对路径优先保留末尾三级，重名时增加目录；目录与行号调暗、文件名突出，路径按目录边界折叠，多目标按整项显示并用 +N 标出省略数量。仅在收起显示层清理 shell 转义和边缘引号；Ctrl+O 查看原始详情。成功不显示 [done]，pending/running/error 与内部失败、取消状态仍显示。",
         ENABLE_DITTO ? "同组连续相同且均已完成的工具，从第二条起右栏显示暗色 ·；工具切换、未完成、错误及新节点首条仍显示工具名。" : "右栏逐条保留完整工具名，L 同上省略未启用。",
         markdownSupported ? "节点说明：首行和续行统一 ▎、两列悬挂、最长 68 列正文；中文与工具目标均不加粗，说明首分句提亮、后续较暗、无逗号或分号的单句使用中亮度，英文标识符独立配色；工具行降亮，摘录第二行使用 └ 连接；模型未遵守格式时保留正文显示。" : "公开 Markdown 接口不可用，节点说明保留正文显示。",
