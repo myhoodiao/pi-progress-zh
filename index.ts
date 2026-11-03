@@ -2,8 +2,8 @@ import { posix, win32 } from "node:path";
 import { VERSION, type ExtensionAPI, type MarkdownTransformContext, type Theme, type ToolRenderContext, type ToolRenderers } from "@earendil-works/pi-coding-agent";
 import { Box, Container, Spacer, Text, parseColor, stripTerminalSequences, truncateToWidth, visibleWidth, wrapTextWithAnsi, type Component } from "@earendil-works/pi-tui";
 
-export const PLUGIN_VERSION = "0.10.1";
-export const TESTED_PI_VERSIONS = ["1.3.0", "1.4.0"];
+export const PLUGIN_VERSION = "0.10.2";
+export const TESTED_PI_VERSIONS = ["1.3.0", "1.4.0", "1.5.0"];
 // These releases have identical assistant/tool spacing components. Unknown releases retain native spacing.
 const SPACING_SUPPORTED = TESTED_PI_VERSIONS.includes(VERSION);
 const STAGE_GAP = 2;
@@ -208,7 +208,7 @@ class PathLabels {
   }
 }
 interface SummarySegment { text: string; file?: boolean; path?: boolean; reference?: boolean; suffix?: string; }
-interface Summary { title: string; detail: string; path: boolean; fileTitle?: boolean; segments?: SummarySegment[]; subline?: string; preview?: PreviewPart[]; continuation?: string; diff?: DiffCounts; }
+interface Summary { title: string; detail: string; path: boolean; fileTitle?: boolean; segments?: SummarySegment[]; subline?: string; preview?: PreviewPart[]; continuation?: string; diff?: DiffCounts; isCommand?: boolean; }
 function fileSummary(title: string, fileTarget: string, prefix = "", suffix = "", diff?: DiffCounts): Summary {
   return {
     title, detail: fileTarget + suffix, path: true, fileTitle: true,
@@ -486,55 +486,10 @@ function excerptPayload(source: string, opaque = false): string {
   return clean(result);
 }
 
-function knownProgram(title: string, source: string): Summary | undefined {
-  const words = literalTokens(source);
-  if (!words?.length) return;
-  const program = programName(words[0]).toLowerCase();
-  if (program === "git") {
-    let offset = 1, repo = "";
-    while (["-C", "-c", "--git-dir", "--work-tree"].includes(words[offset])) {
-      if (!words[offset + 1]) return;
-      if (words[offset] === "-C") repo = words[offset + 1];
-      offset += 2;
-    }
-    const action = words[offset];
-    if (!action || action.startsWith("-")) return primarySummary(title, clean(source));
-    const args = words.slice(offset + 1);
-    const dash = args.indexOf("--");
-    const object = dash >= 0 ? args.slice(dash + 1) : [];
-    if (repo || object.length) return { title, detail: "", path: false,
-      segments: repo && object.length ? [...pathSegments([repo], false), { text: " :: " }, ...pathSegments(object, false)] : pathSegments(object.length ? object : [repo], false),
-      preview: [{ text: `git ${action}`, priority: 100 }, ...optionParts(args).map(part => ({ ...part, priority: /^--(?:hard|force|delete)$|^-D$/.test(part.text) ? 95 : 60 }))] };
-    const useful = args.filter((arg, index) => !["-m", "--message"].includes(arg) && !["-m", "--message"].includes(args[index - 1]));
-    const detail = ["git", action, ...useful].join(" ");
-    return visibleWidth(detail) <= 40 && useful.length <= 3 ? primarySummary(title, detail)
-      : primarySummary(title, `git ${action}`, optionParts([`git ${action}`, ...useful]));
-  }
-  if (["npm", "pnpm", "yarn", "bun", "pip", "pip3", "uv", "dotnet", "cargo", "go", "pytest", "make", "cmake"].includes(program)) {
-    const meaningful = words.slice(1).filter((word, i) => !["--prefix", "--cwd", "-C"].includes(word) && !["--prefix", "--cwd", "-C"].includes(words[i]));
-    const location = words.findIndex(word => ["--prefix", "--cwd", "-C"].includes(word));
-    if (location >= 0 && words[location + 1]) return { title, detail: "", path: false, segments: pathSegments([words[location + 1]], false), preview: [{ text: program, priority: 100 }, ...optionParts(meaningful).map(part => ({ ...part, priority: 70 }))] };
-    const detail = [program, ...meaningful].join(" ");
-    return visibleWidth(detail) <= 40 && meaningful.length <= 3 ? primarySummary(title, detail)
-      : primarySummary(title, [program, meaningful[0]].filter(Boolean).join(" "), optionParts([program, ...meaningful]));
-  }
-  if (["curl", "wget"].includes(program)) {
-    const url = words.find(word => /^['"]?https?:\/\//i.test(word));
-    if (!url) return;
-    const parts: PreviewPart[] = [{ text: program, priority: 100 }];
-    for (let i = 1; i < words.length; i++) {
-      if (/^--(?:data(?:-raw|-binary)?|form)=/.test(words[i])) { parts.push({ text: `${words[i].split("=")[0]} …`, priority: 85 }); continue; }
-      if (/^(?:--(?:request|output|method)=|-(?:X|o).+)/.test(words[i])) { parts.push({ text: clean(words[i]), priority: 85 }); continue; }
-      if (/^(?:-d|--data(?:-raw|-binary)?|-F|--form)$/.test(words[i])) { parts.push({ text: `${words[i]} …`, priority: 85 }); i++; continue; }
-      if (/^(?:-H|--header|--user|-u)$/.test(words[i])) { i++; continue; }
-      if (["-X", "--request", "-o", "--output", "-O", "-L", "--location", "--method", "-I", "--head", "-G", "--get"].includes(words[i])) {
-        const flag = words[i], takesValue = ["-X", "--request", "-o", "--output", "--method"].includes(flag);
-        parts.push({ text: takesValue && words[i + 1] ? `${flag} ${words[++i]}` : flag, priority: 85 });
-      }
-    }
-    return { title, detail: "", path: false, segments: pathSegments([unquoteWord(url)], false), preview: parts };
-  }
-}
+/**
+ * Unwraps shell wrappers (bash -c, powershell -Command, cmd /c, etc.)
+ * and heredocs, revealing the core invocation command.
+ */
 function stripEnvPrefix(source: string): string {
   const words = commandWords(source);
   let index = 0;
@@ -544,231 +499,241 @@ function stripEnvPrefix(source: string): string {
   for (let i = 0; i < index; i++) cursor = source.indexOf(words[i], cursor) + words[i].length;
   return source.slice(cursor).trim();
 }
-function stripScriptComment(line: string): string {
-  let quote = "";
-  for (let i = 0; i < line.length; i++) {
-    const ch = line[i];
-    if (ch === "\\" && quote) { i++; continue; }
-    if (quote) { if (ch === quote) quote = ""; continue; }
-    if (ch === "'" || ch === '"') { quote = ch; continue; }
-    if (ch === "#") return line.slice(0, i);
-  }
-  return line;
-}
-function splitScriptStatements(source: string): string[] {
-  const result: string[] = [];
-  for (const rawLine of source.split(/\r?\n/)) {
-    const line = stripScriptComment(rawLine).trim();
-    if (!line) continue;
-    let start = 0, quote = "", depth = 0;
-    for (let i = 0; i < line.length; i++) {
-      const ch = line[i];
-      if (ch === "\\" && quote) { i++; continue; }
-      if (quote) { if (ch === quote) quote = ""; continue; }
-      if (ch === "'" || ch === '"') { quote = ch; continue; }
-      if ("([{".includes(ch)) depth++;
-      else if (")]}".includes(ch)) depth = Math.max(0, depth - 1);
-      else if (!depth && ch === ";") {
-        const part = line.slice(start, i).trim();
-        if (part) result.push(part);
-        start = i + 1;
-      }
+
+function unwrapCommand(source: string, depth = 0): string {
+  if (depth > 5) return source.trim();
+  let trimmed = source.trim();
+  if (!trimmed) return "";
+
+  trimmed = stripEnvPrefix(trimmed);
+
+  // 1. Heredoc: runner <<-? 'EOF' ... EOF
+  const heredoc = trimmed.match(/^(?:python(?:3(?:\.\d+)?)?|py|node|nodejs|bash|sh|pwsh|powershell)\b[^\n]*<<-?\s*(['"]?)([A-Za-z_]\w*)\1[ \t]*\r?\n([\s\S]*?)(?:\r?\n\2[ \t]*$|$)/i);
+  if (heredoc) {
+    const runner = heredoc[0].split(/\s+/)[0];
+    if (/^(?:bash|sh|pwsh|powershell)$/i.test(runner)) {
+      return unwrapCommand(heredoc[3], depth + 1);
     }
-    const tail = line.slice(start).trim();
-    if (tail) result.push(tail);
+    return trimmed;
   }
-  return result;
-}
-function classifyScriptLiteral(raw: string, inPathContext = false): { text: string; file: boolean; path: boolean } | undefined {
-  const value = raw.trim().replace(/\\\\/g, "\\");
-  if (!value || /[\x00-\x1f<>|{}]/.test(value) || /(?:---|===)/.test(value)) return;
-  if (/^https?:\/\/[^\s'"<>|{}]+$/i.test(value)) return { text: value, file: false, path: true };
-  if (/[*?]/.test(value)) return;
-  if (/^(?:[A-Za-z]:[\\/]|\\\\[A-Za-z0-9_.-]+[\\/])[^\x00-\x1f"*?<>|{}]+$/.test(value)) return { text: value, file: true, path: true };
-  if (/^~[\\/][^\x00-\x1f"*?<>|{}\s]+$/.test(value)) return { text: value, file: true, path: true };
-  if (/^(?:\.\.?[\\/]|[A-Za-z0-9_.-]+(?:[\\/][A-Za-z0-9_.-]+)+)$/.test(value)
-    && !/^(?:Mozilla|application|text|image|audio|video|multipart)\//i.test(value)
-    && (inPathContext || /\.(?:md|json|jsonl|js|mjs|cjs|ts|tsx|py|yaml|yml|toml|txt|html|css|sh|ps1|cmd|bat)$/i.test(value))) {
-    return { text: value, file: true, path: true };
-  }
-}
-/** Extract concrete file/directory/URL targets from inline scripts without executing code. */
-function extractScriptTargets(body: string): SummarySegment[] {
-  const cleanLines = body.split(/\r?\n/).map(stripScriptComment);
-  const cleanBody = cleanLines.join("\n");
-  const statements = splitScriptStatements(body);
-  const pathVars = new Map<string, string>();
-  const listVars = new Map<string, string[]>();
-  for (const match of cleanBody.matchAll(/\b(?:for\s+([A-Za-z_]\w*)\s+in\s+|([A-Za-z_]\w*)\s*=\s*)\[([^\]]+)\]/g)) {
-    const name = match[1] ?? match[2];
-    const items = [...match[3].matchAll(/[rR]?(['"])([^'"\r\n]+)\1/g)].map(m => m[2].trim()).filter(Boolean);
-    if (name && items.length) listVars.set(name, items);
-  }
-  for (const stmt of statements) {
-    const assign = stmt.match(/^(?:(?:const|let|var)\s+)?([A-Za-z_]\w*)\s*=\s*(?:Path\(\s*)?[rR]?(['"])([^'"\r\n]+)\2\s*\)?$/);
-    if (assign) {
-      const classified = classifyScriptLiteral(assign[3], true);
-      if (classified?.file) pathVars.set(assign[1], classified.text.replace(/[\\/]+$/, ""));
+
+  // 2. Exact shell wrappers:
+  // bash/sh/zsh: -c or -lc
+  const bashMatch = trimmed.match(/^(?:[A-Za-z]:[\\/][^\s]+\\|\/(?:usr\/)?(?:bin|local\/bin)\/)?(?:bash|sh|zsh)(?:\.exe)?(?:\s+(?:--login|-l|-s|--noprofile|--norc))*\s+(-(?:lc|c))\s+([\s\S]+)$/i);
+  if (bashMatch) {
+    let inner = bashMatch[2].trim();
+    if ((inner.startsWith('"') && inner.endsWith('"')) || (inner.startsWith("'") && inner.endsWith("'"))) {
+      inner = inner.slice(1, -1).trim();
     }
+    return unwrapCommand(inner, depth + 1);
   }
-  const directVars = new Set<string>();
-  for (const match of cleanBody.matchAll(/\b(?:listdir|walk|scandir|open|exists|isdir|isfile|read_text|write_text|glob|rglob)\s*\(\s*([A-Za-z_]\w*)\s*[,)]/g)) {
-    if (pathVars.has(match[1])) directVars.add(match[1]);
-  }
-  const concreteJoinedVars = new Set<string>();
-  for (const match of cleanBody.matchAll(/\b(?:os\.path\.join|posix\.join|win32\.join|path\.join|join)\s*\(\s*([A-Za-z_]\w*)\s*,\s*(?:[rR]?(['"])([^'"\r\n]+)\2|([A-Za-z_]\w*))\s*\)/g)) {
-    if (pathVars.has(match[1]) && (match[3] || (match[4] && listVars.has(match[4])))) concreteJoinedVars.add(match[1]);
-  }
-  for (const match of cleanBody.matchAll(/\b([A-Za-z_]\w*)\s*\/\s*[rR]?(['"])([^'"\r\n]+)\2/g)) {
-    if (pathVars.has(match[1])) concreteJoinedVars.add(match[1]);
-  }
-  const seen = new Set<string>();
-  const collected: { text: string; file: boolean; path: boolean }[] = [];
-  const push = (item?: { text: string; file: boolean; path: boolean }) => {
-    if (!item) return;
-    const key = item.text.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
-    if (!key || seen.has(key)) return;
-    seen.add(key);
-    collected.push(item);
-  };
-  const consumedLists = new Set<string>();
-  for (const stmt of statements) {
-    if (/^(?:import\s|from\s+\S+\s+import\b|sys\.std(?:out|err)\.reconfigure\s*\()/i.test(stmt)) continue;
-    const assign = stmt.match(/^(?:(?:const|let|var)\s+)?([A-Za-z_]\w*)\s*=\s*(?:Path\(\s*)?[rR]?(['"])([^'"\r\n]+)\2\s*\)?$/);
-    if (assign && pathVars.has(assign[1])) {
-      if (directVars.has(assign[1]) || !concreteJoinedVars.has(assign[1])) push({ text: pathVars.get(assign[1])!, file: true, path: true });
-      continue;
+
+  // powershell/pwsh: -Command or -c (never -EncodedCommand)
+  const psMatch = trimmed.match(/^(?:[A-Za-z]:[\\/][^\s]+\\|\/(?:usr\/)?(?:bin|local\/bin)\/)?(?:powershell|pwsh)(?:\.exe)?(?:\s+-(?:NoProfile|noprofile|NonInteractive|STA|MTA|NoLogo|ExecutionPolicy\s+\w+))*\s+(-(?:Command|c))\s+([\s\S]+)$/i);
+  if (psMatch) {
+    let inner = psMatch[2].trim();
+    if ((inner.startsWith('"') && inner.endsWith('"')) || (inner.startsWith("'") && inner.endsWith("'"))) {
+      inner = inner.slice(1, -1).trim();
     }
-    const isPrint = /^(?:print|console\.(?:log|info|warn|error))\s*\(/.test(stmt);
-    const scopes = isPrint
-      ? [...stmt.matchAll(/\b(?:open|listdir|walk|scandir|Path|join|copy\w*|rmtree|get_\w+|urlopen|Request)\s*\(([^)]*)\)/g)].map(m => m[0])
-      : [stmt];
-    for (let scope of scopes) {
-      scope = scope.replace(/\b(?:os\.path\.join|posix\.join|win32\.join|path\.join|join)\s*\(\s*([^,()]+?)\s*,\s*([^,()]+?)\s*\)/g, (full, rawBase, rawChild) => {
-        const baseVar = rawBase.trim();
-        const baseLit = rawBase.trim().match(/^[rR]?(['"])([^'"\r\n]+)\1$/)?.[2];
-        const baseClassified = baseLit ? classifyScriptLiteral(baseLit, true) : undefined;
-        const basePath = pathVars.get(baseVar) ?? (baseClassified?.file ? baseClassified.text.replace(/[\\/]+$/, "") : undefined);
-        if (!basePath) return full;
-        const childLit = rawChild.trim().match(/^[rR]?(['"])([^'"\r\n]+)\1$/)?.[2];
-        const childVar = rawChild.trim();
-        if (childLit) { push({ text: `${basePath}/${childLit.replace(/^[\\/]+/, "")}`, file: true, path: true }); return ""; }
-        if (listVars.has(childVar)) {
-          consumedLists.add(childVar);
-          for (const item of listVars.get(childVar)!) push({ text: `${basePath}/${item.replace(/^[\\/]+/, "")}`, file: true, path: true });
-          return "";
-        }
-        return full;
-      });
-      scope = scope.replace(/\b([A-Za-z_]\w*)\s*\/\s*[rR]?(['"])([^'"\r\n]+)\2/g, (full, baseVar, _q, childLit) => {
-        const basePath = pathVars.get(baseVar);
-        if (!basePath) return full;
-        push({ text: `${basePath}/${childLit.replace(/^[\\/]+/, "")}`, file: true, path: true });
-        return "";
-      });
-      const inPathCall = /\b(?:Path|open|listdir|walk|scandir|exists|isdir|isfile|copy\w*|rmtree|read_text|write_text|glob|rglob)\s*\(/.test(scope);
-      for (const lit of scope.matchAll(/([fFrR]{0,2})(['"])([^'"\r\n]+)\2/g)) {
-        const prefix = lit[1].toLowerCase(), rawVal = lit[3];
-        if (prefix.includes("f") && /^https?:\/\/[^\s'"<>]+\{[A-Za-z_]\w*\}/i.test(rawVal)) {
-          for (const [, items] of listVars) if (items.every(item => /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(item))) {
-            for (const item of items) push({ text: item, file: false, path: false });
-          }
-          for (const call of cleanBody.matchAll(/\bget_[A-Za-z_]\w*\(\s*(['"])([^'"\r\n]+)\1\s*\)/g)) {
-            push({ text: rawVal.replace(/\{[A-Za-z_]\w*\}/, call[2]), file: false, path: true });
-          }
-          continue;
-        }
-        push(classifyScriptLiteral(rawVal, inPathCall));
-      }
+    return unwrapCommand(inner, depth + 1);
+  }
+
+  // cmd: /c
+  const cmdMatch = trimmed.match(/^(?:[A-Za-z]:[\\/][^\s]+\\|\/(?:usr\/)?(?:bin|local\/bin)\/)?cmd(?:\.exe)?(?:\s+\/[a-zA-Z])*\s+\/c\s+([\s\S]+)$/i);
+  if (cmdMatch) {
+    let inner = cmdMatch[1].trim();
+    if ((inner.startsWith('"') && inner.endsWith('"')) || (inner.startsWith("'") && inner.endsWith("'"))) {
+      inner = inner.slice(1, -1).trim();
     }
+    return unwrapCommand(inner, depth + 1);
   }
-  for (const [name, items] of listVars) {
-    if (consumedLists.has(name)) continue;
-    for (const item of items) push(classifyScriptLiteral(item, true));
-  }
-  return collected.flatMap((item, index) => [...(index ? [{ text: ", " }] : []), { text: clean(item.text), file: item.file, path: item.path }]);
-}
-function scriptSummary(title: string, program: string, flag: string, body: string): Summary {
-  const globs = [...body.matchAll(/^[ \t]*(?:for\s+[A-Za-z_]\w*\s+in\s+|[A-Za-z_]\w*\s*=\s*)?Path\(\s*(['"])([^'"\n]+)\1\s*\)\.glob\(\s*(['"])([^'"\n]+)\3\s*\)/gm)];
-  if (globs.length === 1) {
-    const glob = globs[0];
-    const line = body.slice(glob.index!).split(/\r?\n/)[0];
-    return { title, detail: "", path: false, segments: pathSegments([`${glob[2].replace(/[\\/]$/, "")}/${glob[4]}`], false), subline: `${program} ${flag} '… ${clean(line)} …'` };
-  }
-  const targets = extractScriptTargets(body);
-  if (targets.length) {
-    return { title, detail: "", path: false, fileTitle: targets.some(segment => segment.file), segments: targets };
-  }
-  return codeFallback(title, body, true);
-}
-function commandSummary(title: string, value: unknown, depth = 0): Summary {
-  const rawSource = typeof value === "string" ? stripTerminalSequences(value).trim() : "";
-  if (!rawSource) return primarySummary(title, "…");
-  const source = stripEnvPrefix(rawSource);
-  const heredoc = source.match(/^(python(?:3(?:\.\d+)?)?|py|node|nodejs|bash|sh|pwsh|powershell)\b[^\n]*<<-?\s*(['"]?)([A-Za-z_]\w*)\2[ \t]*\r?\n([\s\S]*?)(?:\r?\n\3[ \t]*$|$)/i);
-  if (heredoc && depth < 3) {
-    const [, runner, , , body] = heredoc;
-    if (/^(?:bash|sh|pwsh|powershell)$/i.test(runner)) return commandSummary(title, body, depth + 1);
-    return scriptSummary(title, programName(runner), "-c", body);
-  }
-  const words = commandWords(source);
-  const program = programName(words[0] ?? "");
-  const ps = parsedPowerShell(title, source);
-  if (ps) return ps;
-  const scan = scanCommand(source);
-  if (scan.steps.length > 1) {
-    const first = commandSummary(title, scan.steps[0], depth + 1);
-    const separator = scan.operators[0] === "\n" ? "…" : `${scan.operators[0]} …`;
-    const targets = scan.steps.map(step => commandSummary(title, step, depth + 1)).flatMap(summary => summary.segments ?? []).filter(segment => segment.text !== ", ");
-    return { ...first, segments: targets.length ? targets.flatMap((segment, index) => [...(index ? [{ text: ", " }] : []), segment]) : first.segments,
-      subline: first.subline ?? excerptPayload(scan.steps[0]), continuation: separator };
-  }
-  const encoded = /^(?:powershell|pwsh)$/i.test(program) && words.find(word => /^-(?:EncodedCommand|enc)$/i.test(word));
-  if (encoded) return primarySummary(title, `${encoded} …`);
-  const shell = /^(?:powershell|pwsh|cmd|bash|sh)$/i.test(program);
-  const script = /^(?:python(?:3(?:\.\d+)?)?|py|node|nodejs)$/i.test(program);
-  const flag = words.findIndex((word, index) => index > 0 && (shell ? /^(?:-Command|-c|-lc|\/c)$/i.test(word) : script && /^(?:-c|-e|--eval)$/.test(word)));
-  if (flag > 0 && depth < 3) {
-    let cursor = 0;
-    for (let i = 0; i <= flag; i++) cursor = source.indexOf(words[i], cursor) + words[i].length;
-    let body = source.slice(cursor).trim();
-    if ((body.startsWith("'") && body.endsWith("'")) || (body.startsWith('"') && body.endsWith('"'))) body = body.slice(1, -1);
-    if (shell) return commandSummary(title, body, depth + 1);
-    return scriptSummary(title, program, words[flag], body);
-  }
-  const known = knownProgram(title, source);
-  if (known) return { ...known, preview: undefined, subline: known.preview ? excerptPayload(source) : undefined };
-  const literal = literalCommandTarget(source);
-  if (literal) {
-    const simple = /^(?:cat|ls|type)$/i.test(program) && words.length === 2;
-    const simpleScript = script && words.length === 2 && !words.includes("--test");
-    return { title: simple ? `${program}  ${title}` : title, detail: "", path: false, segments: literal.segments,
-      subline: simple || simpleScript ? undefined : excerptPayload(source) };
-  }
-  return codeFallback(title, source);
+
+  return trimmed;
 }
 
-function codeFallback(title: string, source: string, opaque = false): Summary {
-  const rawLines = source.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
-  const lines = opaque && rawLines.length === 1 && rawLines[0].includes(";") ? splitScriptStatements(source) : rawLines;
-  const substantive = lines.filter(line => !/^(?:#|import\s|from\s|\$ErrorActionPreference\s*=|sys\.std(?:out|err)\.reconfigure\s*\(|os\.environ(?:\[|\.get\b).*=\s*)/i.test(line)
-    && !/^print\s*\(\s*[rR]?(['"])[-=_*\s]{3,}.*\1\s*\)$/i.test(line)
-    && !(opaque && lines.length > 1 && /^[A-Za-z_]\w*$/.test(line)));
-  let first = substantive[0] ?? lines[0] ?? "…";
-  if (opaque && substantive.length > 1 && /[[({:]$/.test(first)) {
-    first = `${first} ${substantive[1]}`;
+function extractCodemodeCommand(raw: unknown): string {
+  if (typeof raw !== "string") return "";
+  const trimmed = raw.trim();
+  const match = trimmed.match(/^\s*\{\s*"(?:command|cmd)"\s*:\s*"((?:[^"\\]|\\.)*)/i);
+  if (match) {
+    try {
+      return JSON.parse(`"${match[1]}"`);
+    } catch {
+      return match[1].replace(/\\"/g, '"').replace(/\\\\/g, "\\");
+    }
   }
-  let cleanFirst = excerptPayload(first, opaque);
-  if (opaque && substantive.length > 1 && visibleWidth(cleanFirst) < 24 && !/(\[[A-Za-z_.]+\]::[A-Za-z_$][\w$]*|[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+(?=\s*\())/.test(first)) {
-    cleanFirst = `${cleanFirst}; ${excerptPayload(substantive[1], opaque)}`;
+  return clean(trimmed);
+}
+
+function maskCommandSensitive(source: string): string {
+  let masked = source.replace(/(-(?:EncodedCommand|enc)\s+)[^\s]+/i, "$1…");
+  masked = excerptPayload(masked);
+  return masked;
+}
+
+function splitStatements(line: string, runner: string): string[] {
+  const trimmedLine = line.trim();
+  const isPython = runner.toLowerCase().startsWith("py");
+  if (!trimmedLine) return [];
+  if (isPython ? trimmedLine.startsWith("#") : trimmedLine.startsWith("//")) return [];
+
+  const stmts: string[] = [];
+  let current = "";
+  let inQuote: string | null = null;
+  let parenDepth = 0;
+
+  for (let i = 0; i < line.length; i++) {
+    const char = line[i];
+    if (inQuote) {
+      current += char;
+      if (char === inQuote && line[i - 1] !== "\\") inQuote = null;
+    } else if (char === '"' || char === "'") {
+      inQuote = char;
+      current += char;
+    } else if (char === "(" || char === "[" || char === "{") {
+      parenDepth++;
+      current += char;
+    } else if (char === ")" || char === "]" || char === "}") {
+      if (parenDepth > 0) parenDepth--;
+      current += char;
+    } else if (parenDepth === 0 && (isPython ? char === "#" : (char === "/" && line[i + 1] === "/"))) {
+      break;
+    } else if (parenDepth === 0 && char === ";") {
+      if (current.trim()) stmts.push(current.trim());
+      current = "";
+    } else {
+      current += char;
+    }
   }
-  if (!substantive.length) return primarySummary(title, cleanFirst);
-  const api = first.match(/(\[[A-Za-z_.]+\]::[A-Za-z_$][\w$]*|[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+(?=\s*\())/)?.[1];
-  if (api) return { title, detail: api, path: false, subline: cleanFirst };
-  // A literal loop header and its body are two excerpts of one call, not new calls.
-  const loop = source.match(/^\s*((?:for|foreach|while)\s*\([^{}]*\)\s*\{)([\s\S]*)\}\s*$/i);
-  if (loop) return { title, detail: `${clean(loop[1])} … }`, path: false, subline: excerptPayload(loop[2], opaque) };
-  return primarySummary(title, cleanFirst);
+  if (current.trim()) stmts.push(current.trim());
+  return stmts;
+}
+
+function isScriptBoilerplate(stmt: string, runner: string): boolean {
+  const trimmed = stmt.trim();
+  const isPython = runner.toLowerCase().startsWith("py");
+  if (!trimmed) return true;
+  if (isPython ? trimmed.startsWith("#") : trimmed.startsWith("//")) return true;
+  if (/^(?:import\s+[\w.]+|from\s+[\w.]+\s+import)/.test(trimmed)) return true;
+  if (/^(?:const|let|var)\s+\w+\s*=\s*require\(/.test(trimmed)) return true;
+  return isSetupBoilerplate(trimmed);
+}
+
+function extractInlineScriptSummary(source: string, title: string): Summary | undefined {
+  const trimmed = stripEnvPrefix(source.trim());
+  let runner = "";
+  let body: string | null = null;
+
+  // 1. Heredoc
+  const heredoc = trimmed.match(/^(python(?:3(?:\.\d+)?)?|py|node|nodejs)\b[^\n]*<<-?\s*(['"]?)([A-Za-z_]\w*)\2[ \t]*\r?\n([\s\S]*?)(?:\r?\n\3[ \t]*$|$)/i);
+  if (heredoc) {
+    runner = heredoc[1];
+    body = heredoc[4];
+  } else {
+    // 2. Inline -c or -e
+    const inline = trimmed.match(/^(python(?:3(?:\.\d+)?)?|py|node|nodejs)\b.*?\s+-[ce]\s+([\s\S]+)$/i);
+    if (inline) {
+      runner = inline[1];
+      let raw = inline[2].trim();
+      if ((raw.startsWith('"') && raw.endsWith('"')) || (raw.startsWith("'") && raw.endsWith("'"))) {
+        raw = raw.slice(1, -1).trim();
+      }
+      body = raw;
+    }
+  }
+
+  if (!runner || body == null) return undefined;
+
+  const runnerName = runner.toLowerCase().startsWith("py") ? "python" : runner.toLowerCase().startsWith("node") ? "node" : runner;
+  const isPython = runnerName === "python";
+
+  // Filter whole-line comments for target extraction to prevent commented paths from being identified as active targets
+  const uncommentedBody = body.split(/\r?\n/).filter(l => isPython ? !l.trim().startsWith("#") : !l.trim().startsWith("//")).join("\n");
+
+  // A. Search for explicit file or URL target
+  const tm = uncommentedBody.match(/(?:Path|open)\s*\(\s*(?:r|f|b|rf|fr)?['"]([^'"\r\n]{2,})['"]/i)
+    || uncommentedBody.match(/(?:readFile|readFileSync|writeFile|writeFileSync|createReadStream|createWriteStream)\s*\(\s*(?:r|f|b|rf|fr)?['"]([^'"\r\n]{2,})['"]/i)
+    || uncommentedBody.match(/(https?:\/\/[^\s'"<>()]+)/i)
+    || uncommentedBody.match(/[A-Za-z_]\w*\s*=\s*(?:r|f|b|rf|fr)?['"]([A-Za-z]:[\\/][^'"\r\n]+|\/(?:[^'"\r\n]+)[\\/][^'"\r\n]+|[^\s'"\r\n]+\.(?:jsonl|json|txt|md|py|ts|js|csv|log))['"]/i);
+
+  if (tm) {
+    let target = tm[1].trim();
+    // Hide URL user credentials and sensitive query parameters
+    target = target.replace(/(https?:\/\/)[^/@\s]+@/i, "$1…@");
+    target = target.replace(/([?&](?:token|api[_-]?key|key|secret|password|passwd|auth)=)[^&#\s]+/gi, "$1…");
+    return {
+      title,
+      detail: `${runnerName} ${target}`,
+      path: false,
+      segments: [
+        { text: `${runnerName} ` },
+        { text: target, path: true, file: true },
+      ],
+    };
+  }
+
+  // B. Fallback: split by lines and statements, find first non-boilerplate action
+  const lines = body.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+  const statements = lines.flatMap(l => splitStatements(l, runnerName));
+  let firstAction = statements.find(s => !isScriptBoilerplate(s, runnerName));
+  if (!firstAction) firstAction = "…";
+
+  // Mask sensitive credentials: key=val or "key": "val"
+  firstAction = firstAction.replace(/((?:['"])(?:token|password|passwd|secret|api[_-]?key|auth(?:orization)?)(?:['"])\s*[:=]\s*|(?:\b(?:token|password|passwd|secret|api[_-]?key|auth(?:orization)?)\b)\s*[:=]\s*)(['"])[^'"]+\2/gi, "$1$2…$2");
+  firstAction = firstAction.replace(/(-(?:EncodedCommand|enc)\s+)[^\s]+/i, "$1…");
+
+  const cleanCmd = `${runnerName} ${firstAction}`.replace(/\s+/g, " ").trim();
+  return {
+    title,
+    detail: cleanCmd || `${runnerName} …`,
+    path: false,
+    isCommand: true,
+  };
+}
+
+function isSetupBoilerplate(line: string): boolean {
+  return /^(?:sys\.std(?:out|err)\.reconfigure\s*\(|\$ErrorActionPreference\s*=|Set-StrictMode\b)/i.test(line);
+}
+
+function maskInlineScriptStrings(cmd: string): string {
+  // If the command is an inline script with pure comment body like python -c '#...'
+  if (/^(?:python\w*|node|pwsh|powershell|bash|sh)\s+-[ce]\s*['"]?\s*(?:#|\/\/)/i.test(cmd)) {
+    return cmd.replace(/(-[ce]\s*['"]?).*$/i, '$1…"');
+  }
+  // Mask sensitive credentials inside commands
+  return cmd.replace(/(token|password|passwd|secret|api_key|auth(?:orization)?)\s*[:=]\s*(['"])[^'"]+\2/gi, "$1=$2…$2");
+}
+
+function commandSummary(title: string, value: unknown): Summary {
+  const rawSource = typeof value === "string" ? stripTerminalSequences(value).trim() : "";
+  if (!rawSource) return { title, detail: "…", path: false, isCommand: true };
+
+  const inlineScript = extractInlineScriptSummary(rawSource, title);
+  if (inlineScript) return inlineScript;
+
+  const unwrapped = unwrapCommand(rawSource);
+  // Filter whole-line comments
+  const lines = unwrapped.split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 0 && !l.startsWith("#") && !l.startsWith("//"));
+  let mainLine = lines[0] ?? "";
+  if (lines.length > 1 && /^(?:python\w*|node|pwsh|powershell|bash|sh)\s+-[ce]\s*['"]?$/i.test(mainLine)) {
+    const nextSub = lines.slice(1).find(l => !isSetupBoilerplate(l)) ?? lines[1];
+    mainLine = `${mainLine} ${nextSub}`;
+  } else if (isSetupBoilerplate(mainLine)) {
+    mainLine = lines.find(l => !isSetupBoilerplate(l)) ?? mainLine;
+  }
+  // If compound command with ';', take first command
+  const semi = mainLine.indexOf(";");
+  if (semi > 0 && !/['"][^'"]*;[^'"]*['"]/.test(mainLine)) {
+    mainLine = mainLine.slice(0, semi).trim();
+  }
+  mainLine = maskInlineScriptStrings(mainLine);
+  const cleanCmd = maskCommandSensitive(mainLine.replace(/\s+/g, " ").trim());
+  return {
+    title,
+    detail: cleanCmd || "…",
+    path: false,
+    isCommand: true,
+  };
 }
 
 function neutral(theme: Theme, text: string, bold = false): string {
@@ -828,6 +793,13 @@ class SummaryLine implements Component {
     const type = showType ? this.theme.style(`  ${displayTitle}`, { fg: typeColor }) : "";
     const meta = `${type}${suffixStyled}`;
     const metaWidth = visibleWidth(meta);
+    if (this.summary.isCommand) {
+      const rawAvailable = Math.max(0, width - metaWidth);
+      const text = truncateToWidth(this.summary.detail, rawAvailable, "…");
+      const cmdStyled = this.theme.style(text, { fg: light ? NEUTRAL_LIGHT : NEUTRAL_DARK });
+      const padding = rawAvailable > visibleWidth(text) && metaWidth > 0 ? " ".repeat(rawAvailable - visibleWidth(text)) : "";
+      return [truncateToWidth(`${cmdStyled}${padding}${meta}`, width, "…")];
+    }
     const targetText = segments.map(segment => segment.text).join("");
     const rawAvailable = Math.max(0, width - metaWidth);
     const diff = this.diffCounts();
@@ -987,13 +959,21 @@ function missingStageRows(following: readonly SpacingMessage[], hiddenThinking: 
   const targetGap = afterText ? INTRA_GAP : STAGE_GAP;
   let blanks = 0;
   let sawText = !afterText;
+  const isVisiblePart = (part: any) => {
+    if (part.type === "text" && part.text?.trim()) return true;
+    if (part.type === "thinking" && part.thinking?.trim()) {
+      if (VERSION === "1.5.0" && hiddenThinking) return false;
+      return true;
+    }
+    return false;
+  };
   const visible = (part: any) => (part.type === "text" && part.text?.trim()) || (part.type === "thinking" && part.thinking?.trim());
   for (const { message } of following) {
     if (!Array.isArray(message?.content) || ["error", "aborted", "length"].includes(message.stopReason)) return 0;
     const parts = message.content;
     const firstTool = parts.findIndex((part: any) => part.type === "toolCall");
     if (firstTool >= 0 && parts.slice(firstTool + 1).some(visible)) return 0;
-    if (parts.some(visible)) blanks++; // Native assistant leading Spacer(1).
+    if (parts.some(isVisiblePart)) blanks++; // Native assistant leading Spacer(1).
     for (let index = 0; index < parts.length; index++) {
       const part = parts[index];
       if (part.type === "text" && part.text?.trim()) {
@@ -1007,10 +987,12 @@ function missingStageRows(following: readonly SpacingMessage[], hiddenThinking: 
       for (; index < parts.length && parts[index].type === "thinking"; index++) nonempty ||= Boolean(parts[index].thinking?.trim());
       index--;
       if (!nonempty) continue;
-      // An empty hidden label still has ANSI styling and renders one blank Text row.
-      // With thinking expanded, our Markdown transformer returns zero rows instead.
-      if (hiddenThinking) blanks++;
-      if (parts.slice(index + 1).some(visible)) blanks++;
+   // In Pi 1.4.0, an empty hidden label renders blank rows.
+      // In Pi 1.5.0, AssistantMessageComponent skips empty thinking, producing 0 blanks.
+      if (VERSION !== "1.5.0") {
+        if (hiddenThinking) blanks++;
+        if (parts.slice(index + 1).some(visible)) blanks++;
+      }
     }
   }
   return 0; // No visible successor yet: do not reserve a trailing blank area.
@@ -1178,6 +1160,13 @@ export function quietRenderers(toolName: string, original?: ToolRenderers, group
       const native = context.expanded || toolName === "read"
         ? originalComponent(original, "call", args, undefined, undefined, theme, context) : undefined;
       if (context.expanded) {
+        if (["bash", "powershell"].includes(toolName) && typeof args?.command === "string") {
+          const rawCmd = args.command;
+          const prompt = theme.style("$ ", { fg: theme.appearance === "light" ? RAIL_LIGHT : RAIL_DARK });
+          const cmdText = `${theme.fg("toolTitle", toolName)}\n${prompt}${rawCmd}`;
+          return wrap(context, "call", framed(new Text(cmdText, 0, 0), theme, context));
+        }
+        const native = originalComponent(original, "call", args, undefined, undefined, theme, context);
         const fallback = framed(new Text(`${theme.fg("toolTitle", toolName)}\n${formatArguments(args)}`, 0, 0), theme, context);
         if (!native) return wrap(context, "call", fallback);
         return wrap(context, "call", new SafeNative(original?.renderShell === "self" ? native : framed(native, theme, context), fallback));
@@ -1204,8 +1193,10 @@ export function quietRenderers(toolName: string, original?: ToolRenderers, group
           const rowContext = { ...context, isPartial: call.status === "running", isError: call.status === "error" || call.status === "cancelled" };
           let args: any;
           try { args = typeof call.args === "string" ? JSON.parse(call.args) : call.args; } catch { /* Keep non-JSON native summaries below. */ }
+          const cmdCandidate = ["bash", "powershell"].includes(call.name) ? extractCodemodeCommand(call.args) : "";
           const summary = args && typeof args === "object" ? summarize(call.name, args, undefined, context.cwd, patchDiffCounts(call.details))
             : ["read", "edit", "write", "ls", "grep", "find"].includes(call.name) ? fileSummary(clean(call.name), clean(call.args))
+            : ["bash", "powershell"].includes(call.name) ? commandSummary(call.name, cmdCandidate || clean(call.args))
             : { title: clean(call.name), detail: clean(call.args), path: false };
           const ditto = ENABLE_DITTO && status === "done" && prevStatus === "done" && summary.title === prevTitle;
           if (SPACING_SUPPORTED && !(context.showImages && context.state[imageSlot])) rows.addChild(new Spacer(INTRA_GAP));
@@ -1216,8 +1207,26 @@ export function quietRenderers(toolName: string, original?: ToolRenderers, group
       }
       const text = result.content.filter(part => part.type === "text").map(part => part.text).join("\n");
       const imageHint = result.content.some(part => part.type === "image") ? "图片显示由 Pi 原生设置控制，可在 /settings 中开启。" : "";
+      if (options.expanded && toolName === "codemode" && Array.isArray(result.details?.calls)) {
+        const prompt = theme.style("$ ", { fg: theme.appearance === "light" ? RAIL_LIGHT : RAIL_DARK });
+        const linesList = result.details.calls.map((call: any) => {
+          if (!call) return "";
+          let cArgs = call.args;
+          try { if (typeof cArgs === "string") cArgs = JSON.parse(cArgs); } catch {}
+          const cCmd = typeof cArgs === "object" && cArgs?.command ? cArgs.command
+            : typeof call.args === "string" ? extractCodemodeCommand(call.args) : "";
+          const errText = call.error ? `\n${call.error}` : "";
+          if (["bash", "powershell"].includes(call.name) && cCmd) {
+            return `${theme.fg("toolTitle", call.name)} [${call.status ?? "done"}]\n${prompt}${cCmd}${errText}`;
+          }
+          return `${theme.fg("toolTitle", call.name ?? "tool")} [${call.status ?? "done"}]\n${formatArguments(call.args)}${errText}`;
+        });
+        const callsText = linesList.filter(Boolean).join("\n\n");
+        const fallback = framed(new Text([callsText, text, imageHint].filter(Boolean).join("\n") || "无输出或返回", 0, 0), theme, context);
+        return wrap(context, "result", fallback);
+      }
       const calls = toolName === "codemode" && result.details?.calls ? formatArguments(result.details.calls) : "";
-      const fallback = framed(new Text([calls, text, imageHint].filter(Boolean).join("\n") || "没有文字输出。", 0, 0), theme, context);
+      const fallback = framed(new Text([calls, text, imageHint].filter(Boolean).join("\n") || "无输出或返回", 0, 0), theme, context);
       const native = originalComponent(original, "result", undefined, result, options, theme, context);
       if (!native) return wrap(context, "result", fallback);
       return wrap(context, "result", new SafeNative(original?.renderShell === "self" ? native : framed(native, theme, context), fallback));
@@ -1292,22 +1301,15 @@ export default function (pi: ExtensionAPI) {
   const groups = new ToolGroups(() => safeGetSettings()?.hideThinkingBlock === true);
   const paths = new PathLabels();
   pi.registerCommand("progress", {
-    description: "status：查看中文过程展示状态和详情入口",
+    description: "status：查看中文过程展示状态与版本信息",
     handler: async (args, ctx) => {
       if (args.trim() && args.trim() !== "status") { ctx.ui.notify("用法：/progress status", "info"); return; }
-      const settings = safeGetSettings() ?? {};
-      ctx.ui.notify([
-        `中文过程展示 ${PLUGIN_VERSION}；当前 Pi ${VERSION}。间距适配 Pi ${TESTED_PI_VERSIONS.join(" / ")}；当前组合 G+H+I+J${INTRA_GAP === 1 ? "+K" : ""}${ENABLE_DITTO ? "+L" : ""}，保留半屏一至两行摘要、右缘元信息栏、C 目标优先与重复片段省略；实际观感待用户验收。`,
-        supported ? "有文字或 thinking 的响应在原位置显示工具摘要；空白响应仍可集中。收起态先显示目标，再在右缘显示弱化的工具名和状态；简单操作一行，复杂命令第二行显示关键动作和条件；每行连同缩进、工具名和状态不超过可用宽度的一半，未知命令也受限。edit/write 单行显示绿色 +N 新增行与红色 -M 删除行；内联脚本跳过固定初始化并优先提取操作路径或 URL 单行展示。显示具体对象和真实代码片段，保留原有管道或分号，不新增类别标签或箭头链；未知脚本直接保留可读的原始片段。第二行只在包含新增对象、参数或条件时显示；仅重复目标或只剩 && …、; … 时省略，Ctrl+O 仍可查看完整命令。文件目标为 #C9BA9A，错误只在末尾标柔和红色；Ctrl+O 展开原有详情。" : "公开工具渲染接口不可用，工具摘要未启用。",
-        "摘要路径：工作目录内使用相对路径，外部绝对路径优先保留末尾三级，重名时增加目录；目录与行号调暗、文件名突出，路径按目录边界折叠，多目标按整项显示并用 +N 标出省略数量。仅在收起显示层清理 shell 转义和边缘引号；Ctrl+O 查看原始详情。成功不显示 [done]，pending/running/error 与内部失败、取消状态仍显示。",
-        ENABLE_DITTO ? "同组连续相同且均已完成的工具，从第二条起右栏显示暗色 ·；工具切换、未完成、错误及新节点首条仍显示工具名。" : "右栏逐条保留完整工具名，L 同上省略未启用。",
-        markdownSupported ? "节点说明：首行和续行统一 ▎、两列悬挂、最长 68 列正文；中文与工具目标均不加粗，说明首分句提亮、后续较暗、无逗号或分号的单句使用中亮度，英文标识符独立配色；工具行降亮，摘录第二行使用 └ 连接；模型未遵守格式时保留正文显示。" : "公开 Markdown 接口不可用，节点说明保留正文显示。",
-        "说明由当前主模型正常输出；插件不另发模型请求，不追加独立说明节点。",
-        SPACING_SUPPORTED ? `间距补齐已启用：收起态说明到命令及同组命令间以 ${INTRA_GAP} 行空白为目标，跨节点保持 ${STAGE_GAP} 行；只补不足，原生超过目标的保留。展开或工具组实际含可显示图片时保留原生布局。` : "当前 Pi 版本未验证间距模型，自动停用补齐；原生留白保留。",
-        "字体由终端决定；不修改 Pi 原生分隔、消息记录或 thinking。",
-        `原生 thinking：${markdownSupported ? "插件仅在界面隐藏正文，原始记录保留" : settings.hideThinkingBlock ? "宿主设置隐藏" : "可见"}；工具图片：${settings.terminal?.showImages === false ? "已隐藏" : "允许显示"}。图片继续服从 Pi 原生开关。`,
-        ctx.mode === "tui" ? "当前为终端界面。" : "当前不是终端界面，工具协议和原始结果仍正常输出。",
-      ].join("\n"), supported ? "info" : "warning");
+      const versionLine = `插件版本：${PLUGIN_VERSION}（当前 Pi ${VERSION}）`;
+      const statusText = supported
+        ? (SPACING_SUPPORTED ? "正常启用" : "正常启用（自动停用补齐）")
+        : "未启用（渲染接口不可用）";
+      const statusLine = `运行状态：${statusText}`;
+      ctx.ui.notify(`${versionLine}\n${statusLine}`, supported ? "info" : "warning");
     },
   });
   if (!supported) return;
