@@ -2,10 +2,11 @@ import { posix, win32 } from "node:path";
 import { VERSION, type ExtensionAPI, type MarkdownTransformContext, type Theme, type ToolRenderContext, type ToolRenderers } from "@earendil-works/pi-coding-agent";
 import { Box, Container, Spacer, Text, parseColor, stripTerminalSequences, truncateToWidth, visibleWidth, wrapTextWithAnsi, type Component } from "@earendil-works/pi-tui";
 
-export const PLUGIN_VERSION = "0.10.2";
-export const TESTED_PI_VERSIONS = ["1.3.0", "1.4.0", "1.5.0"];
-// These releases have identical assistant/tool spacing components. Unknown releases retain native spacing.
+export const PLUGIN_VERSION = "0.10.3";
+export const TESTED_PI_VERSIONS = ["1.3.0", "1.4.0", "1.5.0", "1.5.2"];
+// Only explicitly adapted releases receive spacing compensation.
 const SPACING_SUPPORTED = TESTED_PI_VERSIONS.includes(VERSION);
+const SKIPS_HIDDEN_THINKING = VERSION === "1.5.0" || VERSION === "1.5.2";
 const STAGE_GAP = 2;
 // Independent visual options: G+H+I+J uses INTRA_GAP = 2 and ENABLE_DITTO = false.
 const INTRA_GAP = 2; // K: set to 1 for tighter spacing within a narration node.
@@ -951,7 +952,7 @@ interface GroupRow {
 }
 interface SpacingMessage { message: any; }
 interface ToolGroup { ids: string[]; rows: Map<string, GroupRow>; invalidating: boolean; before: SpacingMessage[]; following: SpacingMessage[]; }
-/** Pi 1.3.0/1.4.0's ordinary assistant prefix, before its first visible text/tool.
+/** Adapted Pi releases' ordinary assistant prefix, before the first visible text/tool.
  * Only add missing rows. Never erase native spacing or touch stored messages.
  * Unknown/interleaved/error layouts retain the native spacing instead of guessing.
  */
@@ -962,7 +963,7 @@ function missingStageRows(following: readonly SpacingMessage[], hiddenThinking: 
   const isVisiblePart = (part: any) => {
     if (part.type === "text" && part.text?.trim()) return true;
     if (part.type === "thinking" && part.thinking?.trim()) {
-      if (VERSION === "1.5.0" && hiddenThinking) return false;
+      if (SKIPS_HIDDEN_THINKING && hiddenThinking) return false;
       return true;
     }
     return false;
@@ -987,9 +988,9 @@ function missingStageRows(following: readonly SpacingMessage[], hiddenThinking: 
       for (; index < parts.length && parts[index].type === "thinking"; index++) nonempty ||= Boolean(parts[index].thinking?.trim());
       index--;
       if (!nonempty) continue;
-   // In Pi 1.4.0, an empty hidden label renders blank rows.
-      // In Pi 1.5.0, AssistantMessageComponent skips empty thinking, producing 0 blanks.
-      if (VERSION !== "1.5.0") {
+      // Older hosts render blank rows for an empty hidden label.
+      // Pi 1.5.0/1.5.2 skip hidden thinking with an empty label entirely.
+      if (!SKIPS_HIDDEN_THINKING) {
         if (hiddenThinking) blanks++;
         if (parts.slice(index + 1).some(visible)) blanks++;
       }

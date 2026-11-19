@@ -17,6 +17,7 @@ assert.ok([1, 2].includes(INTRA_GAP));
 const install = join(homedir(), ".pi", "agent", "install");
 const release = process.env.PI_PROGRESS_TEST_RELEASE ?? readFileSync(join(install, "current-version"), "utf8").trim();
 assert.match(release, /^\d+\.\d+\.\d+$/);
+const skipsHiddenThinking = ["1.5.0", "1.5.2"].includes(release);
 const modules = join(install, "releases", release, "node_modules");
 const agentRoot = join(modules, "@earendil-works", "pi-coding-agent");
 const agent = await import(pathToFileURL(join(agentRoot, "dist", "index.js")));
@@ -431,8 +432,9 @@ test("images obey the native display setting and never dump encoded data", () =>
 
 async function transformerSetup() {
   await extension.handlers.get("session_start")[0]({}, { mode: "tui", sessionManager: { getBranch: () => [] }, ui: { theme, setToolsExpanded() {}, setHiddenThinkingLabel() {} } });
-  assert.equal(typeof extension.markdownTransformer, "function");
-  return extension.markdownTransformer;
+  const transform = extension.markdownTransformer?.transformer ?? extension.markdownTransformer;
+  assert.equal(typeof transform, "function");
+  return transform;
 }
 
 function assistantCalls(ids) {
@@ -608,7 +610,7 @@ async function stage(content, { stopReason = "toolUse", showImages = false } = {
   await observe({ role: "assistant", content: [] }, "message_start");
   await observe(message);
   await observe(message, "message_end");
-  const assistant = new agent.AssistantMessageComponent(message, hiddenThinking, agent.getMarkdownTheme(), "", 1, [extension.markdownTransformer]);
+  const assistant = new agent.AssistantMessageComponent(message, hiddenThinking, agent.getMarkdownTheme(), "", 1, [extension.markdownTransformer?.transformer ?? extension.markdownTransformer]);
   const tools = content.filter(part => part.type === "toolCall").map(call => {
     const item = component(call.name, call.arguments, undefined, { callId: call.id, showImages });
     item.updateResult(goodResult(), false);
@@ -637,8 +639,8 @@ test("normal stages distinguish intra-node and stage gaps while larger native ga
     const before = JSON.stringify(stages.map(s => s.message));
     for (const width of [32, 80, 140]) {
       const items = stages.flatMap(s => s.items);
-      assert.deepEqual(visibleGaps(items, width), Array.from({ length: 23 }, (_, i) => i % 2 === 0 ? INTRA_GAP : (release === "1.5.0" ? (!hidden && i % 4 === 1 ? 3 : 2) : (hidden && i % 4 === 1 ? 3 : 2))));
-      assert.equal(transcript(items, width).length, (release === "1.5.0" ? (hidden ? 47 : 53) : (hidden ? 53 : 47)) + 12 * INTRA_GAP); // Same 24 visible lines; native three-row prefixes are retained.
+      assert.deepEqual(visibleGaps(items, width), Array.from({ length: 23 }, (_, i) => i % 2 === 0 ? INTRA_GAP : (skipsHiddenThinking ? (!hidden && i % 4 === 1 ? 3 : 2) : (hidden && i % 4 === 1 ? 3 : 2))));
+      assert.equal(transcript(items, width).length, (skipsHiddenThinking ? (hidden ? 47 : 53) : (hidden ? 53 : 47)) + 12 * INTRA_GAP); // Same 24 visible lines; native three-row prefixes are retained.
       assert.ok(transcript(items, width).every(row => tui.visibleWidth(row) <= width));
     }
     assert.equal(JSON.stringify(stages.map(s => s.message)), before);
@@ -670,9 +672,9 @@ test("streaming snapshots update padding without accumulating rows or reserving 
   assert.equal(a.tools[0].render(80).length, 3);
   const withThinking = { ...next, content: [thought, thought, ...next.content] };
   for (let i = 0; i < 10; i++) await observe(withThinking);
-  assert.equal(a.tools[0].render(80).length, release === "1.5.0" ? 3 : 2);
+  assert.equal(a.tools[0].render(80).length, skipsHiddenThinking ? 3 : 2);
   await observe(withThinking, "message_end");
-  assert.equal(a.tools[0].render(80).length, release === "1.5.0" ? 3 : 2);
+  assert.equal(a.tools[0].render(80).length, skipsHiddenThinking ? 3 : 2);
 });
 
 test("expansion, errors and image permission retain native details without compensation", async () => {
@@ -700,7 +702,7 @@ test("large native gaps are not inflated globally and user boundaries stop compe
   const empty = await stage([thought]);
   const b = await stage([thought, narration("已有大间距"), ...assistantCalls(["large-gap-b"]).content]);
   const c = await stage([narration("普通间距"), ...assistantCalls(["large-gap-c"]).content]);
-  assert.deepEqual(visibleGaps([...a.items, ...empty.items, ...b.items, ...c.items]), [release === "1.5.0" ? 2 : 5, INTRA_GAP, 2, INTRA_GAP]);
+  assert.deepEqual(visibleGaps([...a.items, ...empty.items, ...b.items, ...c.items]), [skipsHiddenThinking ? 2 : 5, INTRA_GAP, 2, INTRA_GAP]);
   await observe({ role: "user", content: "新任务" }, "message_start");
   const d = await stage([narration("新任务说明"), ...assistantCalls(["large-gap-d"]).content]);
   assert.equal(c.tools[0].render(80).length, 1 + INTRA_GAP); // Only its explanation-to-tool top-up remains.
@@ -794,7 +796,7 @@ test("streaming explanation-to-tool padding is stable through repeated tool snap
   const message = { role: "assistant", content: [narration("流式说明"), ...assistantCalls(["stream-two"]).content], stopReason: "toolUse" };
   await observe(message);
   const tool = component("read", { path: "stream-two.md" }, undefined, { callId: "stream-two" });
-  const assistant = new agent.AssistantMessageComponent(message, true, agent.getMarkdownTheme(), "", 1, [extension.markdownTransformer]);
+  const assistant = new agent.AssistantMessageComponent(message, true, agent.getMarkdownTheme(), "", 1, [extension.markdownTransformer?.transformer ?? extension.markdownTransformer]);
   for (let index = 0; index < 20; index++) await observe(structuredClone(message));
   assert.deepEqual(visibleGaps([assistant, tool]), [INTRA_GAP]);
   tool.updateResult(goodResult(), false);
@@ -842,7 +844,7 @@ test("status identifies the trial version and its limits", async () => {
   const notices = [];
   await extension.commands.get("progress").handler("status", { mode: "tui", ui: { notify: text => notices.push(text) } });
   const text = notices.join("\n");
-  assert.match(text, /插件版本：0\.10\.2/);
+  assert.match(text, /插件版本：0\.10\.3/);
   assert.match(text, new RegExp(`当前 Pi ${release}`));
   assert.match(text, /运行状态：正常启用/);
   // Ensure the verbose guide paragraphs are completely removed
